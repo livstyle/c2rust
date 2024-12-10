@@ -1,6 +1,7 @@
 use self::mir_op::MirRewrite;
-use self::unlower::{MirOrigin, PreciseLoc};
+use self::unlower::{PreciseLoc, UnlowerMap};
 use crate::context::{AnalysisCtxt, Assignment};
+use crate::last_use::LastUse;
 use crate::pointee_type::PointeeTypes;
 use crate::pointer_id::PointerTable;
 use crate::rewrite::Rewrite;
@@ -9,7 +10,7 @@ use rustc_hir::BodyId;
 use rustc_middle::mir::{Body, Location};
 use rustc_middle::ty::TyCtxt;
 use rustc_span::Span;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
 mod convert;
 mod distribute;
@@ -25,11 +26,12 @@ pub fn gen_expr_rewrites<'tcx>(
     acx: &mut AnalysisCtxt<'_, 'tcx>,
     asn: &Assignment,
     pointee_types: PointerTable<PointeeTypes<'tcx>>,
+    last_use: &LastUse,
     def_id: DefId,
     mir: &Body<'tcx>,
     hir_body_id: BodyId,
 ) -> Vec<(Span, Rewrite)> {
-    let (mir_rewrites, errors) = mir_op::gen_mir_rewrites(acx, asn, pointee_types, mir);
+    let (mir_rewrites, errors) = mir_op::gen_mir_rewrites(acx, asn, pointee_types, last_use, mir);
     if !errors.is_empty() {
         acx.gacx.dont_rewrite_fns.add(def_id, errors);
     }
@@ -57,7 +59,7 @@ pub fn gen_expr_rewrites<'tcx>(
 fn debug_print_unlower_map<'tcx>(
     tcx: TyCtxt<'tcx>,
     mir: &Body<'tcx>,
-    unlower_map: &BTreeMap<PreciseLoc, MirOrigin>,
+    unlower_map: &UnlowerMap,
     mir_rewrites: &HashMap<Location, Vec<MirRewrite>>,
 ) {
     let print_for_loc = |loc| {
@@ -69,7 +71,15 @@ fn debug_print_unlower_map<'tcx>(
                 .push(&rw.kind);
         }
 
-        for (k, v) in unlower_map.range(&PreciseLoc { loc, sub: vec![] }..) {
+        if unlower_map.discard_rewrites_for(loc) {
+            eprintln!("      DISCARD all rewrites for this location");
+        }
+
+        let mut found_at_least_one_origin = false;
+        for (k, v) in unlower_map
+            .origins_map()
+            .range(&PreciseLoc { loc, sub: vec![] }..)
+        {
             if k.loc != loc {
                 break;
             }
@@ -79,6 +89,14 @@ fn debug_print_unlower_map<'tcx>(
             for rw_kind in rewrites_by_subloc.remove(&sublocs).unwrap_or_default() {
                 eprintln!("        {rw_kind:?}");
             }
+            found_at_least_one_origin = true;
+        }
+
+        if !found_at_least_one_origin {
+            let span = mir
+                .stmt_at(loc)
+                .either(|s| s.source_info.span, |t| t.source_info.span);
+            eprintln!("      {span:?} (no unlowering entries found)");
         }
 
         for (sublocs, rw_kinds) in rewrites_by_subloc {

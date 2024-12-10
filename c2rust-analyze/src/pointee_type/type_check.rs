@@ -1,4 +1,4 @@
-use super::constraint_set::{CTy, ConstraintSet};
+use super::constraint_set::{CTy, ConstraintSet, VarTable};
 use crate::context::{AnalysisCtxt, LTy, PointerId};
 use crate::panic_detail;
 use crate::util::{describe_rvalue, ty_callee, Callee, RvalueDesc, UnknownDefCallee};
@@ -13,6 +13,7 @@ struct TypeChecker<'tcx, 'a> {
     acx: &'a AnalysisCtxt<'a, 'tcx>,
     mir: &'a Body<'tcx>,
     constraints: ConstraintSet<'tcx>,
+    vars: &'a mut VarTable<'tcx>,
 }
 
 impl<'tcx> TypeChecker<'tcx, '_> {
@@ -86,7 +87,10 @@ impl<'tcx> TypeChecker<'tcx, '_> {
     pub fn visit_rvalue(&mut self, rv: &Rvalue<'tcx>, lty: LTy<'tcx>) {
         trace!("visit_rvalue({rv:?}, {lty:?})");
 
-        if let Some(RvalueDesc::Project { base, proj: &[] }) = describe_rvalue(rv) {
+        if let Some(RvalueDesc::Project {
+            base, proj: &[], ..
+        }) = describe_rvalue(rv)
+        {
             // Special case for no-op projections like `&*p`.  Since the pointer is passed through
             // unchanged, we don't require the pointee type to actually match the type used for the
             // paired deref and address-of operations.
@@ -219,7 +223,7 @@ impl<'tcx> TypeChecker<'tcx, '_> {
     pub fn visit_call(&mut self, func: Ty<'tcx>, args: &[Operand<'tcx>], dest_lty: LTy<'tcx>) {
         let tcx = self.acx.tcx();
         let callee = ty_callee(tcx, func);
-        eprintln!("callee = {callee:?}");
+        debug!("callee = {callee:?}");
         match callee {
             Callee::Trivial => {}
             Callee::LocalDef { def_id, substs } => {
@@ -253,7 +257,7 @@ impl<'tcx> TypeChecker<'tcx, '_> {
                 // include information about expected/required pointee types
             }
             Callee::UnknownDef(_) => {
-                log::error!("TODO: visit Callee::{callee:?}");
+                error!("TODO: visit Callee::{callee:?}");
             }
 
             Callee::PtrOffset { .. } => {
@@ -304,7 +308,7 @@ impl<'tcx> TypeChecker<'tcx, '_> {
                 // about the concrete type of the data, but it does ensure that the pointee type of
                 // the argument operand matches the pointee type of other pointers to the same
                 // allocation, which lets us remove a `void*` cast during rewriting.
-                let var = self.constraints.fresh_var();
+                let var = self.vars.fresh();
                 assert_eq!(args.len(), 1);
                 let arg_lty = self.acx.type_of(&args[0]);
                 self.use_pointer_at_type(arg_lty.label, var);
@@ -317,7 +321,7 @@ impl<'tcx> TypeChecker<'tcx, '_> {
                 // variable and solve for it later.
                 //
                 // In the future, we might check the copy length as described for `malloc`.
-                let var = self.constraints.fresh_var();
+                let var = self.vars.fresh();
                 assert_eq!(args.len(), 3);
                 let dest_arg_lty = self.acx.type_of(&args[0]);
                 let src_arg_lty = self.acx.type_of(&args[1]);
@@ -329,7 +333,7 @@ impl<'tcx> TypeChecker<'tcx, '_> {
                 // We treat this much like `memcpy`, but with only a store, not a load.
                 //
                 // In the future, we might check the length as described for `malloc`.
-                let var = self.constraints.fresh_var();
+                let var = self.vars.fresh();
                 assert_eq!(args.len(), 3);
                 let dest_arg_lty = self.acx.type_of(&args[0]);
                 self.use_pointer_at_type(dest_lty.label, var);
@@ -346,11 +350,16 @@ impl<'tcx> TypeChecker<'tcx, '_> {
     }
 }
 
-pub fn visit<'tcx>(acx: &AnalysisCtxt<'_, 'tcx>, mir: &Body<'tcx>) -> ConstraintSet<'tcx> {
+pub fn visit<'tcx>(
+    acx: &AnalysisCtxt<'_, 'tcx>,
+    mir: &Body<'tcx>,
+    vars: &mut VarTable<'tcx>,
+) -> ConstraintSet<'tcx> {
     let mut tc = TypeChecker {
         acx,
         mir,
         constraints: ConstraintSet::default(),
+        vars,
     };
 
     for (bb, bb_data) in mir.basic_blocks().iter_enumerated() {

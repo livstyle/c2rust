@@ -108,7 +108,7 @@ impl<'tcx> ConvertVisitor<'tcx> {
         if let Some(child_span_rw) = self.rewrites.get(&sub_ex.hir_id) {
             let child_rw = &child_span_rw.1;
             if let Some(subst_rw) = child_rw.try_subst(&rw_sub) {
-                eprintln!(
+                debug!(
                     "get_subexpr: substituted {rw_sub:?} into {child_rw:?}, producing {subst_rw:?}"
                 );
                 self.subsumed_child_rewrites
@@ -224,38 +224,96 @@ impl<'tcx> ConvertVisitor<'tcx> {
             }
 
             mir_op::RewriteKind::MemcpySafe {
-                elem_size,
+                ref elem_ty,
                 dest_single,
+                dest_option,
                 src_single,
+                src_option,
             } => {
-                // `memcpy(dest, src, n)` to a `copy_from_slice` call
+                // `memcpy(dest, src, byte_len)` to a `copy_from_slice` call
                 assert!(matches!(hir_rw, Rewrite::Identity));
-                assert!(!dest_single, "&T -> &[T] conversion for memcpy dest NYI");
-                assert!(!src_single, "&T -> &[T] conversion for memcpy src NYI");
-                Rewrite::Block(
-                    vec![
-                        Rewrite::Let(vec![
-                            ("dest".into(), self.get_subexpr(ex, 0)),
-                            ("src".into(), self.get_subexpr(ex, 1)),
-                            ("byte_len".into(), self.get_subexpr(ex, 2)),
-                        ]),
-                        Rewrite::Let(vec![(
-                            "n".into(),
-                            format_rewrite!("byte_len as usize / {elem_size}"),
-                        )]),
-                        Rewrite::MethodCall(
-                            "copy_from_slice".into(),
-                            Box::new(format_rewrite!("dest[..n]")),
-                            vec![format_rewrite!("&src[..n]")],
-                        ),
-                    ],
-                    Some(Box::new(format_rewrite!("dest"))),
-                )
+                let mut stmts = Vec::with_capacity(6);
+
+                stmts.push(Rewrite::Let(vec![
+                    ("dest".into(), self.get_subexpr(ex, 0)),
+                    ("src".into(), self.get_subexpr(ex, 1)),
+                    ("byte_len".into(), self.get_subexpr(ex, 2)),
+                ]));
+                // Best-effort check to detect size mismatches.  This can happen if we infer the
+                // wrong pointee type, or if the C code used a hardcoded size for `elem_ty` but we
+                // changed its size during rewriting, or possibly other cases.  These errors could
+                // potentially cause too few items to be copied, introducing a subtle logic error;
+                // this assertion tries to catch this situation early so it's easier to diagnose.
+                stmts.push(format_rewrite!(
+                    "assert_eq!(byte_len as usize % std::mem::size_of::<{elem_ty}>(), 0)"
+                ));
+                stmts.push(Rewrite::Let(vec![(
+                    "n".into(),
+                    format_rewrite!("byte_len as usize / std::mem::size_of::<{elem_ty}>()"),
+                )]));
+                let mut convert = |var: &str, is_mut, is_single, is_option| {
+                    let single_to_slice = if is_single {
+                        if is_mut {
+                            format_rewrite!("std::slice::from_mut({var})")
+                        } else {
+                            format_rewrite!("std::slice::from_ref({var})")
+                        }
+                    } else {
+                        Rewrite::Text(var.into())
+                    };
+                    let rhs = if is_option {
+                        // ```
+                        // match var {
+                        //     Some(x) => x,  // or slice::from_ref(x), etc
+                        //     None => { assert_eq!(n, 0); &[] },
+                        // }
+                        // ```
+                        let empty_slice = if is_mut {
+                            format_rewrite!("&mut []")
+                        } else {
+                            format_rewrite!("&[]")
+                        };
+                        Rewrite::Match(
+                            Box::new(Rewrite::Text(var.into())),
+                            vec![
+                                (format!("Some({var})"), single_to_slice),
+                                (
+                                    "None".into(),
+                                    Rewrite::Block(
+                                        vec![format_rewrite!("assert_eq!(n, 0)")],
+                                        Some(Box::new(empty_slice)),
+                                    ),
+                                ),
+                            ],
+                        )
+                    } else {
+                        single_to_slice
+                    };
+                    stmts.push(Rewrite::Let1(var.into(), Box::new(rhs)));
+                };
+                convert("dest", true, dest_single, dest_option);
+                convert("src", false, src_single, src_option);
+                // `dest[..n].copy_from_slice(&src[..n]);`
+                stmts.push(Rewrite::MethodCall(
+                    "copy_from_slice".into(),
+                    Box::new(format_rewrite!("dest[..n]")),
+                    vec![format_rewrite!("&src[..n]")],
+                ));
+
+                // TODO: `memcpy` cases that actually use the return value are only partially
+                // supported.  Currently we always return `&mut [T]`, which may not match the
+                // permissions on the output.  Doing this correctly would require saving the
+                // original `dest` and then applying `slice::from_mut`, `OptionDowngrade`, and/or
+                // `DynOwnedDowngrade` to get `&mut [T]` for the call to `copy_from_slice`.  This
+                // would allow ownership to flow from `p` to `q` in `q = memcpy(p, ...)`, for
+                // example.  Fortunately, most code just uses `memcpy` for its side effect and
+                // ignores the return value.
+                Rewrite::Block(stmts, Some(Box::new(format_rewrite!("dest"))))
             }
 
             mir_op::RewriteKind::MemsetZeroize {
                 ref zero_ty,
-                elem_size,
+                ref elem_ty,
                 dest_single,
             } => {
                 // `memset(dest, 0, n)` to assignments that zero out each field of `*dest`
@@ -275,9 +333,13 @@ impl<'tcx> ConvertVisitor<'tcx> {
                             ("val".into(), self.get_subexpr(ex, 1)),
                             ("byte_len".into(), self.get_subexpr(ex, 2)),
                         ]),
+                        // Best-effort check to detect size mismatches, as in `MemcpySafe`.
+                        format_rewrite!(
+                            "assert_eq!(byte_len as usize % std::mem::size_of::<{elem_ty}>(), 0)"
+                        ),
                         Rewrite::Let(vec![(
                             "n".into(),
-                            format_rewrite!("byte_len as usize / {elem_size}"),
+                            format_rewrite!("byte_len as usize / std::mem::size_of::<{elem_ty}>()"),
                         )]),
                         format_rewrite!("assert_eq!(val, 0, \"non-zero memset NYI\")"),
                         zeroize_body,
@@ -288,12 +350,12 @@ impl<'tcx> ConvertVisitor<'tcx> {
 
             mir_op::RewriteKind::MallocSafe {
                 ref zero_ty,
-                elem_size,
+                ref elem_ty,
                 single,
             }
             | mir_op::RewriteKind::CallocSafe {
                 ref zero_ty,
-                elem_size,
+                ref elem_ty,
                 single,
             } => {
                 // `malloc(n)` -> `Box::new(z)` or similar
@@ -302,9 +364,15 @@ impl<'tcx> ConvertVisitor<'tcx> {
                 let mut stmts = match *rw {
                     mir_op::RewriteKind::MallocSafe { .. } => vec![
                         Rewrite::Let(vec![("byte_len".into(), self.get_subexpr(ex, 0))]),
+                        // Best-effort check to detect size mismatches, as in `MemcpySafe`.
+                        format_rewrite!(
+                            "assert_eq!(byte_len as usize % std::mem::size_of::<{elem_ty}>(), 0)"
+                        ),
                         Rewrite::Let1(
                             "n".into(),
-                            Box::new(format_rewrite!("byte_len as usize / {elem_size}")),
+                            Box::new(format_rewrite!(
+                                "byte_len as usize / std::mem::size_of::<{elem_ty}>()"
+                            )),
                         ),
                     ],
                     mir_op::RewriteKind::CallocSafe { .. } => vec![
@@ -312,7 +380,9 @@ impl<'tcx> ConvertVisitor<'tcx> {
                             ("count".into(), self.get_subexpr(ex, 0)),
                             ("size".into(), self.get_subexpr(ex, 1)),
                         ]),
-                        format_rewrite!("assert_eq!(size, {elem_size})"),
+                        format_rewrite!(
+                            "assert_eq!(size as usize, std::mem::size_of::<{elem_ty}>())"
+                        ),
                         Rewrite::Let1("n".into(), Box::new(format_rewrite!("count as usize"))),
                     ],
                     _ => unreachable!(),
@@ -342,9 +412,10 @@ impl<'tcx> ConvertVisitor<'tcx> {
 
             mir_op::RewriteKind::ReallocSafe {
                 ref zero_ty,
-                elem_size,
+                ref elem_ty,
                 src_single,
                 dest_single,
+                option,
             } => {
                 // `realloc(p, n)` -> `Box::new(...)`
                 assert!(matches!(hir_rw, Rewrite::Identity));
@@ -354,9 +425,15 @@ impl<'tcx> ConvertVisitor<'tcx> {
                         ("src_ptr".into(), self.get_subexpr(ex, 0)),
                         ("dest_byte_len".into(), self.get_subexpr(ex, 1)),
                     ]),
+                    // Best-effort check to detect size mismatches, as in `MemcpySafe`.
+                    format_rewrite!(
+                        "assert_eq!(dest_byte_len as usize % std::mem::size_of::<{elem_ty}>(), 0)"
+                    ),
                     Rewrite::Let1(
                         "dest_n".into(),
-                        Box::new(format_rewrite!("dest_byte_len as usize / {elem_size}")),
+                        Box::new(format_rewrite!(
+                            "dest_byte_len as usize / std::mem::size_of::<{elem_ty}>()"
+                        )),
                     ),
                 ];
                 if dest_single {
@@ -364,9 +441,14 @@ impl<'tcx> ConvertVisitor<'tcx> {
                 }
                 let expr = match (src_single, dest_single) {
                     (false, false) => {
+                        let src = if option {
+                            "src_ptr.unwrap_or(Box::new([]))"
+                        } else {
+                            "src_ptr"
+                        };
                         stmts.push(Rewrite::Let1(
                             "mut dest_ptr".into(),
-                            Box::new(Rewrite::Text("Vec::from(src_ptr)".into())),
+                            Box::new(format_rewrite!("Vec::from({src})")),
                         ));
                         stmts.push(format_rewrite!(
                             "dest_ptr.resize_with(dest_n, || {})",
@@ -375,8 +457,9 @@ impl<'tcx> ConvertVisitor<'tcx> {
                         Rewrite::Text("dest_ptr.into_boxed_slice()".into())
                     }
                     (false, true) => {
+                        let opt_flatten = if option { ".flatten()" } else { "" };
                         format_rewrite!(
-                            "src_ptr.into_iter().next().unwrap_or_else(|| {})",
+                            "src_ptr.into_iter(){opt_flatten}.next().unwrap_or_else(|| {})",
                             zeroize_expr
                         )
                     }
@@ -385,16 +468,28 @@ impl<'tcx> ConvertVisitor<'tcx> {
                             "mut dest_ptr".into(),
                             Box::new(Rewrite::Text("Vec::with_capacity(dest_n)".into())),
                         ));
-                        stmts.push(Rewrite::Text(
-                            "if dest_n >= 1 { dest_ptr.push(*src_ptr); }".into(),
-                        ));
+                        if option {
+                            stmts.push(Rewrite::Text(
+                                "if dest_n >= 1 { if let Some(src) = src_ptr { dest_ptr.push(*src); } }".into(),
+                            ));
+                        } else {
+                            stmts.push(Rewrite::Text(
+                                "if dest_n >= 1 { dest_ptr.push(*src_ptr); }".into(),
+                            ));
+                        }
                         stmts.push(format_rewrite!(
                             "dest_ptr.resize_with(dest_n, || {})",
                             zeroize_expr,
                         ));
                         Rewrite::Text("dest_ptr.into_boxed_slice()".into())
                     }
-                    (true, true) => Rewrite::Text("src_ptr".into()),
+                    (true, true) => {
+                        if option {
+                            format_rewrite!("src_ptr.unwrap_or_else(|| Box::new({}))", zeroize_expr)
+                        } else {
+                            Rewrite::Text("src_ptr".into())
+                        }
+                    }
                 };
                 Rewrite::Block(stmts, Some(Box::new(expr)))
             }
@@ -584,7 +679,7 @@ impl<'tcx> Visitor<'tcx> for ConvertVisitor<'tcx> {
         hir_rw = self.rewrite_from_mir_rws(Some(ex), mir_rws, hir_rw);
 
         if !matches!(hir_rw, Rewrite::Identity) {
-            eprintln!(
+            debug!(
                 "rewrite {:?} at {:?} (materialize? {})",
                 hir_rw, callsite_span, self.materialize_adjustments
             );
@@ -679,6 +774,7 @@ fn generate_zeroize_code(zero_ty: &ZeroizeType, lv: &str) -> String {
     match *zero_ty {
         ZeroizeType::Int => format!("{lv} = 0"),
         ZeroizeType::Bool => format!("{lv} = false"),
+        ZeroizeType::Option => format!("{lv} = None"),
         ZeroizeType::Array(ref elem_zero_ty) => format!(
             "
             {{
@@ -690,7 +786,7 @@ fn generate_zeroize_code(zero_ty: &ZeroizeType, lv: &str) -> String {
             generate_zeroize_code(elem_zero_ty, "(*elem)")
         ),
         ZeroizeType::Struct(_, ref fields) => {
-            eprintln!("zeroize: {} fields on {lv}: {fields:?}", fields.len());
+            debug!("zeroize: {} fields on {lv}: {fields:?}", fields.len());
             let mut s = String::new();
             writeln!(s, "{{").unwrap();
             for (name, field_zero_ty) in fields {
@@ -712,6 +808,7 @@ fn generate_zeroize_expr(zero_ty: &ZeroizeType) -> String {
     match *zero_ty {
         ZeroizeType::Int => format!("0"),
         ZeroizeType::Bool => format!("false"),
+        ZeroizeType::Option => format!("None"),
         ZeroizeType::Array(ref elem_zero_ty) => format!(
             "std::array::from_fn(|| {})",
             generate_zeroize_expr(elem_zero_ty)
@@ -758,6 +855,11 @@ pub fn convert_cast_rewrite(kind: &mir_op::RewriteKind, hir_rw: Rewrite) -> Rewr
             Rewrite::Ref(Box::new(place), mutbl_from_bool(mutbl))
         }
 
+        mir_op::RewriteKind::Deref => {
+            // `p` -> `*p`
+            Rewrite::Deref(Box::new(hir_rw))
+        }
+
         mir_op::RewriteKind::OptionUnwrap => {
             // `p` -> `p.unwrap()`
             Rewrite::MethodCall("unwrap".to_string(), Box::new(hir_rw), vec![])
@@ -779,20 +881,34 @@ pub fn convert_cast_rewrite(kind: &mir_op::RewriteKind, hir_rw: Rewrite) -> Rewr
             )
         }
 
-        mir_op::RewriteKind::OptionDowngrade { mutbl, deref } => {
+        mir_op::RewriteKind::OptionDowngrade { mutbl, kind } => {
             // `p` -> `Some(p)`
-            let ref_method = if deref {
-                if mutbl {
-                    "as_deref_mut".into()
-                } else {
-                    "as_deref".into()
+            match kind {
+                mir_op::OptionDowngradeKind::Borrow => {
+                    let ref_method = if mutbl {
+                        "as_mut".into()
+                    } else {
+                        "as_ref".into()
+                    };
+                    Rewrite::MethodCall(ref_method, Box::new(hir_rw), vec![])
                 }
-            } else if mutbl {
-                "as_mut".into()
-            } else {
-                "as_ref".into()
-            };
-            Rewrite::MethodCall(ref_method, Box::new(hir_rw), vec![])
+                mir_op::OptionDowngradeKind::Deref => {
+                    let ref_method = if mutbl {
+                        "as_deref_mut".into()
+                    } else {
+                        "as_deref".into()
+                    };
+                    Rewrite::MethodCall(ref_method, Box::new(hir_rw), vec![])
+                }
+                mir_op::OptionDowngradeKind::MoveAndDeref => {
+                    let closure = if mutbl {
+                        format_rewrite!("|ptr| &mut *ptr")
+                    } else {
+                        format_rewrite!("|ptr| &*ptr")
+                    };
+                    Rewrite::MethodCall("map".into(), Box::new(hir_rw), vec![closure])
+                }
+            }
         }
 
         mir_op::RewriteKind::DynOwnedUnwrap => {

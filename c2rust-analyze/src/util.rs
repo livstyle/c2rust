@@ -1,5 +1,6 @@
 use crate::labeled_ty::LabeledTy;
 use crate::trivial::IsTrivial;
+use log::debug;
 use rustc_ast::ast::AttrKind;
 use rustc_const_eval::interpret::Scalar;
 use rustc_hir::def::DefKind;
@@ -29,6 +30,8 @@ pub enum RvalueDesc<'tcx> {
         base: PlaceRef<'tcx>,
         /// The projection applied to the pointer.  This contains no `Deref` projections.
         proj: &'tcx [PlaceElem<'tcx>],
+        /// Mutability of the resulting reference.
+        mutbl: Mutability,
     },
     /// The address of a local or one of its fields, such as `&x.y`.  The rvalue is split into a
     /// base local (in this case `x`) and a projection (`.y`).  The `&` is implicit.
@@ -36,6 +39,8 @@ pub enum RvalueDesc<'tcx> {
         local: Local,
         /// The projection applied to the local.  This contains no `Deref` projections.
         proj: &'tcx [PlaceElem<'tcx>],
+        /// Mutability of the resulting reference.
+        mutbl: Mutability,
     },
 }
 
@@ -45,10 +50,18 @@ pub fn describe_rvalue<'tcx>(rv: &Rvalue<'tcx>) -> Option<RvalueDesc<'tcx>> {
             Operand::Move(pl) | Operand::Copy(pl) => RvalueDesc::Project {
                 base: pl.as_ref(),
                 proj: &[],
+                // This is an rvalue of an `Assign` statement, so it's always in a non-mutable
+                // position.
+                mutbl: Mutability::Not,
             },
             Operand::Constant(_) => return None,
         },
         Rvalue::Ref(_, _, pl) | Rvalue::AddressOf(_, pl) => {
+            let mutbl = match *rv {
+                Rvalue::Ref(_, kind, _) => kind.to_mutbl_lossy(),
+                Rvalue::AddressOf(mutbl, _) => mutbl,
+                _ => unreachable!(),
+            };
             let projection = &pl.projection[..];
             match projection
                 .iter()
@@ -62,6 +75,7 @@ pub fn describe_rvalue<'tcx>(rv: &Rvalue<'tcx>) -> Option<RvalueDesc<'tcx>> {
                             projection: &projection[..i],
                         },
                         proj: &projection[i + 1..],
+                        mutbl,
                     }
                 }
                 None => {
@@ -69,6 +83,7 @@ pub fn describe_rvalue<'tcx>(rv: &Rvalue<'tcx>) -> Option<RvalueDesc<'tcx>> {
                     RvalueDesc::AddrOfLocal {
                         local: pl.local,
                         proj: projection,
+                        mutbl,
                     }
                 }
             }
@@ -201,7 +216,7 @@ pub enum Callee<'tcx> {
 pub fn ty_callee<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Callee<'tcx> {
     let is_trivial = || {
         let is_trivial = ty.fn_sig(tcx).is_trivial(tcx);
-        eprintln!("{ty:?} is trivial: {is_trivial}");
+        debug!("{ty:?} is trivial: {is_trivial}");
         is_trivial
     };
 
@@ -390,7 +405,7 @@ fn builtin_callee<'tcx>(tcx: TyCtxt<'tcx>, did: DefId, substs: SubstsRef<'tcx>) 
         }
 
         _ => {
-            eprintln!("name: {name:?}");
+            debug!("name: {name:?}");
             None
         }
     }
@@ -537,6 +552,9 @@ pub enum TestAttr {
     /// `#[c2rust_analyze_test::force_non_null_args]`: Mark arguments as `NON_NULL` and don't allow
     /// that flag to be changed during dataflow analysis.
     ForceNonNullArgs,
+    /// `#[c2rust_analyze_test::skip_borrowck]`: Don't run borrowck for this function.  The
+    /// `UNIQUE` permission won't be removed from pointers.
+    SkipBorrowck,
 }
 
 impl TestAttr {
@@ -547,6 +565,7 @@ impl TestAttr {
             TestAttr::FailBeforeRewriting => "fail_before_rewriting",
             TestAttr::SkipRewrite => "skip_rewrite",
             TestAttr::ForceNonNullArgs => "force_non_null_args",
+            TestAttr::SkipBorrowck => "skip_borrowck",
         }
     }
 }

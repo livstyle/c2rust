@@ -10,8 +10,7 @@ use std::ops::Index;
 use crate::borrowck::{OriginArg, OriginParam};
 use crate::context::AdtMetadataTable;
 use crate::context::{
-    AnalysisCtxt, Assignment, FlagSet, FnSigOrigins, GlobalAnalysisCtxt, GlobalAssignment, LTy,
-    PermissionSet,
+    AnalysisCtxt, Assignment, FlagSet, FnSigOrigins, GlobalAnalysisCtxt, LTy, PermissionSet,
 };
 use crate::labeled_ty::{LabeledTy, LabeledTyCtxt};
 use crate::pointee_type::PointeeTypes;
@@ -21,7 +20,7 @@ use crate::type_desc::{self, Ownership, PtrDesc, Quantity, TypeDesc};
 use hir::{
     FnRetTy, GenericParamKind, Generics, ItemKind, Path, PathSegment, VariantData, WherePredicate,
 };
-use log::warn;
+use log::{debug, warn};
 use rustc_ast::ast;
 use rustc_hir as hir;
 use rustc_hir::def::{DefKind, Namespace, Res};
@@ -141,7 +140,7 @@ fn relabel_rewrites<'tcx, P, F, PT>(
     pointee_types: &PT,
     lcx: LabeledTyCtxt<'tcx, RewriteLabel<'tcx>>,
     lty: LTy<'tcx>,
-    gacx: &GlobalAnalysisCtxt<'tcx>,
+    adt_metadata: &AdtMetadataTable,
 ) -> RwLTy<'tcx>
 where
     P: Index<PointerId, Output = PermissionSet>,
@@ -157,7 +156,7 @@ where
             flags,
             pointee_types,
             &[],
-            &gacx.adt_metadata,
+            adt_metadata,
         )
     })
 }
@@ -255,9 +254,9 @@ fn deconstruct_hir_ty<'a, 'tcx>(
                 if type_args.len() < substs.types().count() {
                     // this situation occurs when there are hidden type arguments
                     // such as the allocator `std::alloc::Global` type argument in `Vec`
-                    eprintln!("warning: extra MIR type argument for {adt_def:?}:");
+                    debug!("warning: extra MIR type argument for {adt_def:?}:");
                     for mir_arg in substs.types().into_iter().skip(type_args.len()) {
-                        eprintln!("\t{:?}", mir_arg)
+                        debug!("\t{:?}", mir_arg)
                     }
                 } else if type_args.len() != substs.types().count() {
                     panic!("mismatched number of type arguments for {adt_def:?} and {hir_ty:?}")
@@ -278,7 +277,7 @@ fn deconstruct_hir_ty<'a, 'tcx>(
             Some(v)
         }
         (tk, hir_tk) => {
-            eprintln!("deconstruct_hir_ty: {tk:?} -- {hir_tk:?} not supported");
+            debug!("deconstruct_hir_ty: {tk:?} -- {hir_tk:?} not supported");
             None
         }
     }
@@ -480,7 +479,7 @@ pub fn desc_to_ty<'tcx>(tcx: TyCtxt<'tcx>, desc: TypeDesc<'tcx>) -> Ty<'tcx> {
 }
 
 struct HirTyVisitor<'a, 'tcx> {
-    asn: &'a Assignment<'a>,
+    asn: &'a Assignment,
     pointee_types: PointerTable<'a, PointeeTypes<'tcx>>,
     acx: &'a AnalysisCtxt<'a, 'tcx>,
     rw_lcx: LabeledTyCtxt<'tcx, RewriteLabel<'tcx>>,
@@ -669,12 +668,12 @@ impl<'tcx, 'a> intravisit::Visitor<'tcx> for HirTyVisitor<'a, 'tcx> {
                     assert_eq!(mir_local_decl.source_info.span, hir_local.pat.span);
                     let lty = self.acx.local_tys[*mir_local];
                     let rw_lty = relabel_rewrites(
-                        &self.asn.perms(),
-                        &self.asn.flags(),
+                        self.asn.perms(),
+                        self.asn.flags(),
                         &self.pointee_types,
                         self.rw_lcx,
                         lty,
-                        self.acx.gacx,
+                        &self.acx.gacx.adt_metadata,
                     );
                     let hir_ty = hir_local.ty.unwrap();
                     self.handle_ty(rw_lty, hir_ty);
@@ -682,6 +681,7 @@ impl<'tcx, 'a> intravisit::Visitor<'tcx> for HirTyVisitor<'a, 'tcx> {
             }
             _ => (),
         }
+        intravisit::walk_stmt(self, s);
     }
 }
 
@@ -739,8 +739,8 @@ pub fn gen_ty_rewrites<'tcx>(
                 create_rewrite_label(
                     pointer_lty,
                     args,
-                    &asn.perms(),
-                    &asn.flags(),
+                    asn.perms(),
+                    asn.flags(),
                     &pointee_types,
                     lifetime_lty.label,
                     &acx.gacx.adt_metadata,
@@ -758,8 +758,8 @@ pub fn gen_ty_rewrites<'tcx>(
                 create_rewrite_label(
                     pointer_lty,
                     args,
-                    &asn.perms(),
-                    &asn.flags(),
+                    asn.perms(),
+                    asn.flags(),
                     &pointee_types,
                     lifetime_lty.label,
                     &acx.gacx.adt_metadata,
@@ -859,7 +859,7 @@ pub fn gen_generics_rws<'p, 'tcx>(
 
 pub fn gen_adt_ty_rewrites<'tcx>(
     gacx: &GlobalAnalysisCtxt<'tcx>,
-    gasn: &GlobalAssignment,
+    asn: &Assignment,
     pointee_types: &GlobalPointerTable<PointeeTypes<'tcx>>,
     did: DefId,
 ) -> Vec<(Span, Rewrite)> {
@@ -903,8 +903,8 @@ pub fn gen_adt_ty_rewrites<'tcx>(
                 create_rewrite_label(
                     pointer_lty,
                     args,
-                    &gasn.perms,
-                    &gasn.flags,
+                    &asn.perms,
+                    &asn.flags,
                     pointee_types,
                     lifetime_lty.label,
                     &gacx.adt_metadata,
@@ -924,6 +924,20 @@ pub fn gen_adt_ty_rewrites<'tcx>(
     hir_rewrites
 }
 
+/// Compute the new, rewritten version of `lty`.
+pub fn rewrite_lty<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    lty: LTy<'tcx>,
+    perms: &GlobalPointerTable<PermissionSet>,
+    flags: &GlobalPointerTable<FlagSet>,
+    pointee_types: &PointerTable<PointeeTypes<'tcx>>,
+    adt_metadata: &AdtMetadataTable,
+) -> Ty<'tcx> {
+    let rw_lcx = LabeledTyCtxt::<RewriteLabel>::new(tcx);
+    let rw_lty = relabel_rewrites(perms, flags, pointee_types, rw_lcx, lty, adt_metadata);
+    mk_rewritten_ty(rw_lcx, rw_lty)
+}
+
 /// Print the rewritten types for all locals in `mir`.  This is used for tests and debugging, as it
 /// reveals the inference results even for temporaries and other locals with no type annotation in
 /// the HIR.
@@ -938,15 +952,15 @@ pub fn dump_rewritten_local_tys<'tcx>(
     for (local, decl) in mir.local_decls.iter_enumerated() {
         // TODO: apply `Cell` if `addr_of_local` indicates it's needed
         let rw_lty = relabel_rewrites(
-            &asn.perms(),
-            &asn.flags(),
+            asn.perms(),
+            asn.flags(),
             &pointee_types,
             rw_lcx,
             acx.local_tys[local],
-            acx.gacx,
+            &acx.gacx.adt_metadata,
         );
         let ty = mk_rewritten_ty(rw_lcx, rw_lty);
-        eprintln!(
+        debug!(
             "{:?} ({}): {:?}",
             local,
             describe_local(acx.tcx(), decl),

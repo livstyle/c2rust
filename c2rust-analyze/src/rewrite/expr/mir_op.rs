@@ -8,19 +8,21 @@
 //! materialize adjustments only on code that's subject to some rewrite.
 
 use crate::context::{AnalysisCtxt, Assignment, DontRewriteFnReason, FlagSet, LTy, PermissionSet};
+use crate::last_use::{self, LastUse};
 use crate::panic_detail;
 use crate::pointee_type::PointeeTypes;
-use crate::pointer_id::{PointerId, PointerTable};
+use crate::pointer_id::{GlobalPointerTable, PointerId, PointerTable};
+use crate::rewrite;
 use crate::type_desc::{self, Ownership, Quantity, TypeDesc};
 use crate::util::{self, ty_callee, Callee};
-use log::{error, trace};
+use log::{debug, error, trace};
 use rustc_ast::Mutability;
 use rustc_middle::mir::{
     BasicBlock, Body, BorrowKind, Location, Operand, Place, PlaceElem, PlaceRef, Rvalue, Statement,
     StatementKind, Terminator, TerminatorKind,
 };
 use rustc_middle::ty::print::{FmtPrinter, PrettyPrinter, Print};
-use rustc_middle::ty::{ParamEnv, Ty, TyCtxt, TyKind};
+use rustc_middle::ty::{Ty, TyCtxt, TyKind};
 use std::collections::HashMap;
 use std::ops::Index;
 
@@ -66,6 +68,9 @@ pub enum RewriteKind {
     /// Replace &raw with & or &raw mut with &mut
     RawToRef { mutbl: bool },
 
+    /// Replace `ptr` with `*ptr`.
+    Deref,
+
     /// Replace `ptr.is_null()` with `ptr.is_none()`.
     IsNullToIsNone,
     /// Replace `ptr.is_null()` with the constant `false`.  We use this in cases where the rewritten
@@ -77,20 +82,22 @@ pub enum RewriteKind {
     ZeroAsPtrToNone,
 
     /// Replace a call to `memcpy(dest, src, n)` with a safe copy operation that works on slices
-    /// instead of raw pointers.  `elem_size` is the size of the original, unrewritten pointee
-    /// type, which is used to convert the byte length `n` to an element count.  `dest_single` and
-    /// `src_single` are set when `dest`/`src` is a pointer to a single item rather than a slice.
+    /// instead of raw pointers.  `elem_ty` is the pointee type type, whose size is used to convert
+    /// the byte length `n` to an element count.  `dest_single` and `src_single` are set when
+    /// `dest`/`src` is a pointer to a single item rather than a slice.
     MemcpySafe {
-        elem_size: u64,
+        elem_ty: String,
         dest_single: bool,
+        dest_option: bool,
         src_single: bool,
+        src_option: bool,
     },
-    /// Replace a call to `memset(ptr, 0, n)` with a safe zeroize operation.  `elem_size` is the
-    /// size of the type being zeroized, which is used to convert the byte length `n` to an element
-    /// count.  `dest_single` is set when `dest` is a pointer to a single item rather than a slice.
+    /// Replace a call to `memset(ptr, 0, n)` with a safe zeroize operation.  `elem_ty` is the type
+    /// being zeroized, whose size is used to convert the byte length `n` to an element count.
+    /// `dest_single` is set when `dest` is a pointer to a single item rather than a slice.
     MemsetZeroize {
         zero_ty: ZeroizeType,
-        elem_size: u64,
+        elem_ty: String,
         dest_single: bool,
     },
 
@@ -98,20 +105,21 @@ pub enum RewriteKind {
     /// zero-initialized.
     MallocSafe {
         zero_ty: ZeroizeType,
-        elem_size: u64,
+        elem_ty: String,
         single: bool,
     },
     /// Replace a call to `free(p)` with a safe `drop` operation.
     FreeSafe { single: bool },
     ReallocSafe {
         zero_ty: ZeroizeType,
-        elem_size: u64,
+        elem_ty: String,
         src_single: bool,
         dest_single: bool,
+        option: bool,
     },
     CallocSafe {
         zero_ty: ZeroizeType,
-        elem_size: u64,
+        elem_ty: String,
         single: bool,
     },
 
@@ -131,11 +139,14 @@ pub enum RewriteKind {
     OptionMapEnd,
     /// Downgrade ownership of an `Option` to `Option<&_>` or `Option<&mut _>` by calling
     /// `as_ref()`/`as_mut()` or `as_deref()`/`as_deref_mut()`.
-    OptionDowngrade { mutbl: bool, deref: bool },
+    OptionDowngrade {
+        mutbl: bool,
+        kind: OptionDowngradeKind,
+    },
 
     /// Extract the `T` from `DynOwned<T>`.
     DynOwnedUnwrap,
-    /// Move out of a `DynOwned<T>` and set the original location to empty / non-owned.
+    /// Move out of `&mut DynOwned<T>` and set the original location to empty / non-owned.
     DynOwnedTake,
     /// Wrap `T` in `Ok` to produce `DynOwned<T>`.
     DynOwnedWrap,
@@ -166,12 +177,24 @@ pub enum RewriteKind {
     AsPtr,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OptionDowngradeKind {
+    /// E.g. `Option<T>` to `Option<&mut T>` via `p.as_mut()`
+    Borrow,
+    /// E.g. `Option<Box<T>>` to `Option<&mut T>` via `p.as_deref_mut()`
+    Deref,
+    /// E.g. `Option<&mut T>` to `Option<&T>` via `p.map(|ptr| &*ptr)`
+    MoveAndDeref,
+}
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum ZeroizeType {
     /// Zeroize by storing the literal `0`.
     Int,
     /// Zeroize by storing the literal `false`.
     Bool,
+    /// Zeroize by storing `None`.
+    Option,
     /// Iterate over `x.iter_mut()` and zeroize each element.
     Array(Box<ZeroizeType>),
     /// Zeroize each named field.
@@ -211,11 +234,27 @@ impl PlaceAccess {
     }
 }
 
+/// Named boolean for use with `visit_place`.  `RequireSinglePointer::Yes` means that if the
+/// `Place` ends with a `Deref` projection, the pointer being dereferenced must have
+/// `Quantity::Single`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+enum RequireSinglePointer {
+    No,
+    Yes,
+}
+
+impl RequireSinglePointer {
+    pub fn as_bool(self) -> bool {
+        self == RequireSinglePointer::Yes
+    }
+}
+
 struct ExprRewriteVisitor<'a, 'tcx> {
     acx: &'a AnalysisCtxt<'a, 'tcx>,
-    perms: PointerTable<'a, PermissionSet>,
-    flags: PointerTable<'a, FlagSet>,
+    perms: &'a GlobalPointerTable<PermissionSet>,
+    flags: &'a GlobalPointerTable<FlagSet>,
     pointee_types: PointerTable<'a, PointeeTypes<'tcx>>,
+    last_use: &'a LastUse,
     rewrites: &'a mut HashMap<Location, Vec<MirRewrite>>,
     mir: &'a Body<'tcx>,
     loc: Location,
@@ -228,6 +267,7 @@ impl<'a, 'tcx> ExprRewriteVisitor<'a, 'tcx> {
         acx: &'a AnalysisCtxt<'a, 'tcx>,
         asn: &'a Assignment,
         pointee_types: PointerTable<'a, PointeeTypes<'tcx>>,
+        last_use: &'a LastUse,
         rewrites: &'a mut HashMap<Location, Vec<MirRewrite>>,
         mir: &'a Body<'tcx>,
     ) -> ExprRewriteVisitor<'a, 'tcx> {
@@ -238,6 +278,7 @@ impl<'a, 'tcx> ExprRewriteVisitor<'a, 'tcx> {
             perms,
             flags,
             pointee_types,
+            last_use,
             rewrites,
             mir,
             loc: Location {
@@ -339,9 +380,76 @@ impl<'a, 'tcx> ExprRewriteVisitor<'a, 'tcx> {
         desc.dyn_owned
     }
 
+    /// Check whether the `Place` identified by `which` within the current statement or terminator
+    /// is the last use of a local.
+    fn is_last_use(&self, which: last_use::WhichPlace) -> bool {
+        self.last_use.is_last_use(self.loc, which)
+    }
+
+    fn rewrite_lty(&self, lty: LTy<'tcx>) -> Ty<'tcx> {
+        let tcx = self.acx.tcx();
+        rewrite::ty::rewrite_lty(
+            tcx,
+            lty,
+            &self.perms,
+            &self.flags,
+            &self.pointee_types,
+            &self.acx.gacx.adt_metadata,
+        )
+    }
+
+    fn lty_to_rewritten_str(&self, lty: LTy<'tcx>) -> (Ty<'tcx>, String) {
+        let rewritten_ty = self.rewrite_lty(lty);
+        let tcx = self.acx.tcx();
+        let printer = FmtPrinter::new(tcx, Namespace::TypeNS);
+        let s = rewritten_ty.print(printer).unwrap().into_buffer();
+        (rewritten_ty, s)
+    }
+
+    fn current_sub_loc_as_which_place(&self) -> Option<last_use::WhichPlace> {
+        // This logic is a bit imprecise, but should be correct in the cases where we actually call
+        // it (namely, when the `Place`/`Rvalue` is simply a `Local`).
+        let mut which = None;
+        for sl in &self.sub_loc {
+            match *sl {
+                SubLoc::Dest => {
+                    which = Some(last_use::WhichPlace::Lvalue);
+                }
+                SubLoc::Rvalue => {
+                    which = Some(last_use::WhichPlace::Operand(0));
+                    // Note there may be more entries in `self.sub_loc` giving a more precise
+                    // position, as in `[SubLoc::Rvalue, SubLoc::CallArg(0)]`.  We keep looping
+                    // over `self.sub_loc` and take the last (most precise) entry.
+                }
+                SubLoc::CallArg(i) => {
+                    // In a call, `WhichPlace::Operand(0)` refers to the callee function.
+                    which = Some(last_use::WhichPlace::Operand(i + 1));
+                }
+                SubLoc::RvalueOperand(i) => {
+                    which = Some(last_use::WhichPlace::Operand(i));
+                }
+                SubLoc::RvaluePlace(_) => {}
+                SubLoc::OperandPlace => {}
+                SubLoc::PlaceDerefPointer => {}
+                SubLoc::PlaceFieldBase => {}
+                SubLoc::PlaceIndexArray => {}
+            }
+        }
+        which
+    }
+
+    /// Like `is_last_use`, but infers `WhichPlace` based on `self.sub_loc`.
+    fn current_sub_loc_is_last_use(&self) -> bool {
+        if let Some(which) = self.current_sub_loc_as_which_place() {
+            self.is_last_use(which)
+        } else {
+            false
+        }
+    }
+
     fn visit_statement(&mut self, stmt: &Statement<'tcx>, loc: Location) {
         let _g = panic_detail::set_current_span(stmt.source_info.span);
-        eprintln!(
+        debug!(
             "mir_op::visit_statement: {:?} @ {:?}: {:?}",
             loc, stmt.source_info.span, stmt
         );
@@ -422,6 +530,13 @@ impl<'a, 'tcx> ExprRewriteVisitor<'a, 'tcx> {
                     // place, visit the RHS place mutably and `mem::take` out of it to avoid a
                     // static ownership transfer.
 
+                    // Determine whether it's okay for the cast emitted below to move the
+                    // expression that it's casting.  This is the case if the rvalue is not a
+                    // place, which means it produces a temporary value that can be moved as
+                    // needed, or if the rvalue is a place but is the last use of a local.
+                    let cast_can_move =
+                        !rv.is_place() || (rv.is_local() && v.current_sub_loc_is_last_use());
+
                     // Check whether this assignment transfers ownership of its RHS.  If so, return
                     // the RHS `Place`.
                     let assignment_transfers_ownership = || {
@@ -445,19 +560,34 @@ impl<'a, 'tcx> ExprRewriteVisitor<'a, 'tcx> {
                         // `visit_place` directly with the desired access.
                         v.enter_rvalue_operand(0, |v| {
                             v.enter_operand_place(|v| {
-                                v.visit_place(rv_pl, PlaceAccess::Mut);
+                                eprintln!("BEGIN visit_place for ownership transfer");
+                                v.visit_place(rv_pl, PlaceAccess::Mut, RequireSinglePointer::No);
+                                eprintln!("END visit_place for ownership transfer");
                             });
                         });
+                        // Obtain a reference to the place containing the `DynOwned` pointer.
+                        if v.is_nullable(rv_lty.label) {
+                            v.emit(RewriteKind::OptionDowngrade {
+                                mutbl: true,
+                                kind: OptionDowngradeKind::Borrow,
+                            });
+                            v.emit(RewriteKind::OptionMapBegin);
+                            v.emit(RewriteKind::Deref);
+                        }
+                        // Take the pointer out of that place.
                         v.emit(RewriteKind::DynOwnedTake);
-                        v.emit_cast_lty_lty(rv_lty, pl_lty);
+                        if v.is_nullable(rv_lty.label) {
+                            v.emit(RewriteKind::OptionMapEnd);
+                        }
+                        v.emit_cast_lty_lty(rv_lty, pl_lty, cast_can_move);
                         return;
                     }
 
                     // Normal case: just `visit_rvalue` and emit a cast if needed.
                     v.visit_rvalue(rv, Some(rv_lty));
-                    v.emit_cast_lty_lty(rv_lty, pl_lty)
+                    v.emit_cast_lty_lty_or_borrow(rv_lty, pl_lty, cast_can_move)
                 });
-                self.enter_dest(|v| v.visit_place(pl, PlaceAccess::Mut));
+                self.enter_dest(|v| v.visit_place(pl, PlaceAccess::Mut, RequireSinglePointer::Yes));
             }
             StatementKind::FakeRead(..) => {}
             StatementKind::SetDiscriminant { .. } => todo!("statement {:?}", stmt),
@@ -524,7 +654,9 @@ impl<'a, 'tcx> ExprRewriteVisitor<'a, 'tcx> {
                                 }
 
                                 if !pl_ty.label.is_none() {
-                                    v.emit_cast_lty_lty(lsig.output, pl_ty);
+                                    // Emit a cast.  The call returns a temporary, which the cast
+                                    // is always allowed to move.
+                                    v.emit_cast_lty_lty(lsig.output, pl_ty, true);
                                 }
                             });
                         }
@@ -549,26 +681,31 @@ impl<'a, 'tcx> ExprRewriteVisitor<'a, 'tcx> {
                                 None => return,
                             };
 
-                            let orig_pointee_ty = pointee_lty.ty;
-                            let ty_layout = tcx
-                                .layout_of(ParamEnv::reveal_all().and(orig_pointee_ty))
-                                .unwrap();
-                            let elem_size = ty_layout.layout.size().bytes();
+                            let (_, elem_ty) = v.lty_to_rewritten_str(pointee_lty);
                             let dest_single = !v.perms[dest_lty.label]
                                 .intersects(PermissionSet::OFFSET_ADD | PermissionSet::OFFSET_SUB);
                             let src_single = !v.perms[src_lty.label]
                                 .intersects(PermissionSet::OFFSET_ADD | PermissionSet::OFFSET_SUB);
+                            let dest_option =
+                                !v.perms[dest_lty.label].contains(PermissionSet::NON_NULL);
+                            let src_option =
+                                !v.perms[src_lty.label].contains(PermissionSet::NON_NULL);
                             v.emit(RewriteKind::MemcpySafe {
-                                elem_size,
+                                elem_ty,
                                 src_single,
+                                src_option,
                                 dest_single,
+                                dest_option,
                             });
 
                             if !pl_ty.label.is_none()
                                 && v.perms[pl_ty.label].intersects(PermissionSet::USED)
                             {
                                 let dest_lty = v.acx.type_of(&args[0]);
-                                v.emit_cast_lty_lty(dest_lty, pl_ty);
+                                // TODO: The result of `MemcpySafe` is always a slice, so this cast
+                                // may be using an incorrect input type.  See the comment on the
+                                // `MemcpySafe` case of `rewrite::expr::convert` for details.
+                                v.emit_cast_lty_lty(dest_lty, pl_ty, true);
                             }
                         });
                     }
@@ -588,17 +725,11 @@ impl<'a, 'tcx> ExprRewriteVisitor<'a, 'tcx> {
                                 None => return,
                             };
 
-                            let orig_pointee_ty = pointee_lty.ty;
-                            let ty_layout = tcx
-                                .layout_of(ParamEnv::reveal_all().and(orig_pointee_ty))
-                                .unwrap();
-                            let elem_size = ty_layout.layout.size().bytes();
+                            let (elem_ty, elem_ty_str) = v.lty_to_rewritten_str(pointee_lty);
                             let dest_single = !v.perms[dest_lty.label]
                                 .intersects(PermissionSet::OFFSET_ADD | PermissionSet::OFFSET_SUB);
 
-                            // TODO: use rewritten types here, so that the `ZeroizeType` will
-                            // reflect the actual types and fields after rewriting.
-                            let zero_ty = match ZeroizeType::from_ty(tcx, orig_pointee_ty) {
+                            let zero_ty = match ZeroizeType::from_ty(tcx, elem_ty) {
                                 Some(x) => x,
                                 // TODO: emit void* cast before bailing out, as described above
                                 None => return,
@@ -606,7 +737,7 @@ impl<'a, 'tcx> ExprRewriteVisitor<'a, 'tcx> {
 
                             v.emit(RewriteKind::MemsetZeroize {
                                 zero_ty,
-                                elem_size,
+                                elem_ty: elem_ty_str,
                                 dest_single,
                             });
 
@@ -614,7 +745,7 @@ impl<'a, 'tcx> ExprRewriteVisitor<'a, 'tcx> {
                                 && v.perms[pl_ty.label].intersects(PermissionSet::USED)
                             {
                                 let dest_lty = v.acx.type_of(&args[0]);
-                                v.emit_cast_lty_lty(dest_lty, pl_ty);
+                                v.emit_cast_lty_lty(dest_lty, pl_ty, true);
                             }
                         });
                     }
@@ -653,34 +784,39 @@ impl<'a, 'tcx> ExprRewriteVisitor<'a, 'tcx> {
                             let pointee_lty = match dest_pointee {
                                 Some(x) => x,
                                 // TODO: emit void* cast before bailing out
-                                None => return,
+                                None => {
+                                    trace!("{callee:?}: no pointee type for dest");
+                                    return;
+                                }
                             };
 
-                            let orig_pointee_ty = pointee_lty.ty;
-                            let ty_layout = tcx
-                                .layout_of(ParamEnv::reveal_all().and(orig_pointee_ty))
-                                .unwrap();
-                            let elem_size = ty_layout.layout.size().bytes();
+                            let (_, elem_ty) = v.lty_to_rewritten_str(pointee_lty);
                             let single = !v.perms[dest_lty.label]
                                 .intersects(PermissionSet::OFFSET_ADD | PermissionSet::OFFSET_SUB);
 
-                            // TODO: use rewritten types here, so that the `ZeroizeType` will
-                            // reflect the actual types and fields after rewriting.
-                            let zero_ty = match ZeroizeType::from_ty(tcx, orig_pointee_ty) {
+                            let opt_zero_ty =
+                                ZeroizeType::from_lty(&v.acx, v.perms, v.flags, pointee_lty);
+                            let zero_ty = match opt_zero_ty {
                                 Some(x) => x,
                                 // TODO: emit void* cast before bailing out
-                                None => return,
+                                None => {
+                                    trace!(
+                                        "{callee:?}: failed to compute ZeroizeType \
+                                        for {pointee_lty:?}"
+                                    );
+                                    return;
+                                }
                             };
 
                             let rw = match *callee {
                                 Callee::Malloc => RewriteKind::MallocSafe {
                                     zero_ty,
-                                    elem_size,
+                                    elem_ty,
                                     single,
                                 },
                                 Callee::Calloc => RewriteKind::CallocSafe {
                                     zero_ty,
-                                    elem_size,
+                                    elem_ty,
                                     single,
                                 },
                                 _ => unreachable!(),
@@ -739,7 +875,7 @@ impl<'a, 'tcx> ExprRewriteVisitor<'a, 'tcx> {
                         });
                     }
 
-                    Callee::Realloc => {
+                    ref callee @ Callee::Realloc => {
                         self.enter_rvalue(|v| {
                             let src_lty = v.acx.type_of(&args[0]);
                             let src_pointee = v.pointee_lty(src_lty);
@@ -749,62 +885,80 @@ impl<'a, 'tcx> ExprRewriteVisitor<'a, 'tcx> {
                             let pointee_lty = match common_pointee {
                                 Some(x) => x,
                                 // TODO: emit void* cast before bailing out
-                                None => return,
+                                None => {
+                                    trace!(
+                                        "{callee:?}: no common pointee type \
+                                        between {src_pointee:?} and {dest_pointee:?}"
+                                    );
+                                    return;
+                                }
                             };
 
-                            let orig_pointee_ty = pointee_lty.ty;
-                            let ty_layout = tcx
-                                .layout_of(ParamEnv::reveal_all().and(orig_pointee_ty))
-                                .unwrap();
-                            let elem_size = ty_layout.layout.size().bytes();
+                            let (elem_ty, elem_ty_str) = v.lty_to_rewritten_str(pointee_lty);
                             let dest_single = !v.perms[dest_lty.label]
                                 .intersects(PermissionSet::OFFSET_ADD | PermissionSet::OFFSET_SUB);
                             let src_single = !v.perms[src_lty.label]
                                 .intersects(PermissionSet::OFFSET_ADD | PermissionSet::OFFSET_SUB);
 
-                            // TODO: use rewritten types here, so that the `ZeroizeType` will
-                            // reflect the actual types and fields after rewriting.
-                            let zero_ty = match ZeroizeType::from_ty(tcx, orig_pointee_ty) {
+                            let zero_ty = match ZeroizeType::from_ty(tcx, elem_ty) {
                                 Some(x) => x,
                                 // TODO: emit void* cast before bailing out
-                                None => return,
+                                None => {
+                                    trace!(
+                                        "{callee:?}: failed to compute ZeroizeType \
+                                        for {elem_ty:?}"
+                                    );
+                                    return;
+                                }
                             };
 
                             // Cast input to either `Box<T>` or `Box<[T]>`, as in `free`.
+                            let mut option = false;
                             v.enter_call_arg(0, |v| {
-                                v.emit_cast_lty_adjust(src_lty, |desc| TypeDesc {
-                                    own: Ownership::Box,
-                                    qty: if src_single {
-                                        Quantity::Single
-                                    } else {
-                                        Quantity::Slice
-                                    },
-                                    dyn_owned: false,
-                                    option: desc.option,
-                                    pointee_ty: desc.pointee_ty,
+                                v.emit_cast_lty_adjust(src_lty, |desc| {
+                                    // `realloc(NULL, ...)` is explicitly allowed by the spec, so
+                                    // we can't force an unwrap here by returning `option: false`.
+                                    // Instead, we record the `option` flag as part of the rewrite
+                                    // so the nullable case can be handled appropriately.
+                                    option = desc.option;
+                                    TypeDesc {
+                                        own: Ownership::Box,
+                                        qty: if src_single {
+                                            Quantity::Single
+                                        } else {
+                                            Quantity::Slice
+                                        },
+                                        dyn_owned: false,
+                                        option: desc.option,
+                                        pointee_ty: desc.pointee_ty,
+                                    }
                                 });
                             });
 
                             v.emit(RewriteKind::ReallocSafe {
                                 zero_ty,
-                                elem_size,
+                                elem_ty: elem_ty_str,
                                 src_single,
                                 dest_single,
+                                option,
                             });
 
                             // Cast output from `Box<T>`/`Box<[T]>` to the target type, as in
                             // `malloc`.
                             v.emit_cast_adjust_lty(
-                                |desc| TypeDesc {
-                                    own: Ownership::Box,
-                                    qty: if dest_single {
-                                        Quantity::Single
-                                    } else {
-                                        Quantity::Slice
-                                    },
-                                    dyn_owned: false,
-                                    option: false,
-                                    pointee_ty: desc.pointee_ty,
+                                |desc| {
+                                    TypeDesc {
+                                        own: Ownership::Box,
+                                        qty: if dest_single {
+                                            Quantity::Single
+                                        } else {
+                                            Quantity::Slice
+                                        },
+                                        dyn_owned: false,
+                                        // We always return non-null from `realloc`.
+                                        option: false,
+                                        pointee_ty: desc.pointee_ty,
+                                    }
                                 },
                                 dest_lty,
                             );
@@ -826,7 +980,7 @@ impl<'a, 'tcx> ExprRewriteVisitor<'a, 'tcx> {
     /// Visit an `Rvalue`.  If `expect_ty` is `Some`, also emit whatever casts are necessary to
     /// make the `Rvalue` produce a value of type `expect_ty`.
     fn visit_rvalue(&mut self, rv: &Rvalue<'tcx>, expect_ty: Option<LTy<'tcx>>) {
-        eprintln!("mir_op::visit_rvalue: {:?}, expect {:?}", rv, expect_ty);
+        debug!("mir_op::visit_rvalue: {:?}, expect {:?}", rv, expect_ty);
         match *rv {
             Rvalue::Use(ref op) => {
                 self.enter_rvalue_operand(0, |v| v.visit_operand(op, expect_ty));
@@ -839,7 +993,9 @@ impl<'a, 'tcx> ExprRewriteVisitor<'a, 'tcx> {
                     BorrowKind::Mut { .. } => true,
                     BorrowKind::Shared | BorrowKind::Shallow | BorrowKind::Unique => false,
                 };
-                self.enter_rvalue_place(0, |v| v.visit_place(pl, PlaceAccess::from_bool(mutbl)));
+                self.enter_rvalue_place(0, |v| {
+                    v.visit_place(pl, PlaceAccess::from_bool(mutbl), RequireSinglePointer::No)
+                });
 
                 if let Some(expect_ty) = expect_ty {
                     if self.is_nullable(expect_ty.label) {
@@ -853,7 +1009,9 @@ impl<'a, 'tcx> ExprRewriteVisitor<'a, 'tcx> {
                 // TODO
             }
             Rvalue::AddressOf(mutbl, pl) => {
-                self.enter_rvalue_place(0, |v| v.visit_place(pl, PlaceAccess::from_mutbl(mutbl)));
+                self.enter_rvalue_place(0, |v| {
+                    v.visit_place(pl, PlaceAccess::from_mutbl(mutbl), RequireSinglePointer::No)
+                });
                 if let Some(expect_ty) = expect_ty {
                     let desc = type_desc::perms_to_desc_with_pointee(
                         self.acx.tcx(),
@@ -875,7 +1033,9 @@ impl<'a, 'tcx> ExprRewriteVisitor<'a, 'tcx> {
                 }
             }
             Rvalue::Len(pl) => {
-                self.enter_rvalue_place(0, |v| v.visit_place(pl, PlaceAccess::Imm));
+                self.enter_rvalue_place(0, |v| {
+                    v.visit_place(pl, PlaceAccess::Imm, RequireSinglePointer::No)
+                });
             }
             Rvalue::Cast(_kind, ref op, ty) => {
                 if util::is_null_const_operand(op) && ty.is_unsafe_ptr() {
@@ -911,7 +1071,7 @@ impl<'a, 'tcx> ExprRewriteVisitor<'a, 'tcx> {
                             self.perms[rv_lty.label],
                             self.flags[rv_lty.label],
                         );
-                        eprintln!("Cast with common pointee {:?}:\n  op_desc = {:?}\n  rv_desc = {:?}\n  matches? {}",
+                        debug!("Cast with common pointee {:?}:\n  op_desc = {:?}\n  rv_desc = {:?}\n  matches? {}",
                             pointee_lty, op_desc, rv_desc, op_desc == rv_desc);
                         if op_desc == rv_desc {
                             // After rewriting, the input and output types of the cast will be
@@ -934,7 +1094,9 @@ impl<'a, 'tcx> ExprRewriteVisitor<'a, 'tcx> {
                 self.enter_rvalue_operand(0, |v| v.visit_operand(op, None));
             }
             Rvalue::Discriminant(pl) => {
-                self.enter_rvalue_place(0, |v| v.visit_place(pl, PlaceAccess::Imm));
+                self.enter_rvalue_place(0, |v| {
+                    v.visit_place(pl, PlaceAccess::Imm, RequireSinglePointer::No)
+                });
             }
             Rvalue::Aggregate(ref _kind, ref ops) => {
                 for (i, op) in ops.iter().enumerate() {
@@ -945,7 +1107,9 @@ impl<'a, 'tcx> ExprRewriteVisitor<'a, 'tcx> {
                 self.enter_rvalue_operand(0, |v| v.visit_operand(op, None));
             }
             Rvalue::CopyForDeref(pl) => {
-                self.enter_rvalue_place(0, |v| v.visit_place(pl, PlaceAccess::Imm));
+                self.enter_rvalue_place(0, |v| {
+                    v.visit_place(pl, PlaceAccess::Imm, RequireSinglePointer::No)
+                });
             }
         }
     }
@@ -955,13 +1119,22 @@ impl<'a, 'tcx> ExprRewriteVisitor<'a, 'tcx> {
     fn visit_operand(&mut self, op: &Operand<'tcx>, expect_ty: Option<LTy<'tcx>>) {
         match *op {
             Operand::Copy(pl) | Operand::Move(pl) => {
-                // TODO: should this be Move, Imm, or dependent on the type?
-                self.enter_operand_place(|v| v.visit_place(pl, PlaceAccess::Move));
+                let pl_lty = self.acx.type_of(pl);
+                // Moving out of a `DynOwned` pointer requires `Mut` access rather than `Move`.
+                // TODO: this should probably check `desc.dyn_owned` rather than perms directly
+                let access = if !pl_lty.label.is_none()
+                    && self.perms[pl_lty.label].contains(PermissionSet::FREE)
+                {
+                    PlaceAccess::Mut
+                } else {
+                    PlaceAccess::Move
+                };
+                self.enter_operand_place(|v| v.visit_place(pl, access, RequireSinglePointer::Yes));
 
                 if let Some(expect_ty) = expect_ty {
-                    let ptr_lty = self.acx.type_of(pl);
-                    if !ptr_lty.label.is_none() {
-                        self.emit_cast_lty_lty(ptr_lty, expect_ty);
+                    if !pl_lty.label.is_none() {
+                        let cast_can_move = pl.is_local() && self.current_sub_loc_is_last_use();
+                        self.emit_cast_lty_lty(pl_lty, expect_ty, cast_can_move);
                     }
                 }
             }
@@ -973,26 +1146,39 @@ impl<'a, 'tcx> ExprRewriteVisitor<'a, 'tcx> {
     fn visit_operand_desc(&mut self, op: &Operand<'tcx>, expect_desc: TypeDesc<'tcx>) {
         match *op {
             Operand::Copy(pl) | Operand::Move(pl) => {
-                // TODO: should this be Move, Imm, or dependent on the type?
-                self.visit_place(pl, PlaceAccess::Move);
+                let pl_lty = self.acx.type_of(pl);
+                // Moving out of a `DynOwned` pointer requires `Mut` access rather than `Move`.
+                // TODO: this should probably check `desc.dyn_owned` rather than perms directly
+                let access = if !pl_lty.label.is_none()
+                    && self.perms[pl_lty.label].contains(PermissionSet::FREE)
+                {
+                    PlaceAccess::Mut
+                } else {
+                    PlaceAccess::Move
+                };
+                self.enter_operand_place(|v| v.visit_place(pl, access, RequireSinglePointer::Yes));
 
-                let ptr_lty = self.acx.type_of(pl);
-                if !ptr_lty.label.is_none() {
-                    self.emit_cast_lty_desc(ptr_lty, expect_desc);
+                if !pl_lty.label.is_none() {
+                    self.emit_cast_lty_desc(pl_lty, expect_desc);
                 }
             }
             Operand::Constant(..) => {}
         }
     }
 
-    fn visit_place(&mut self, pl: Place<'tcx>, access: PlaceAccess) {
+    fn visit_place(
+        &mut self,
+        pl: Place<'tcx>,
+        access: PlaceAccess,
+        require_single_ptr: RequireSinglePointer,
+    ) {
         let mut ltys = Vec::with_capacity(1 + pl.projection.len());
         ltys.push(self.acx.type_of(pl.local));
         for proj in pl.projection {
             let prev_lty = ltys.last().copied().unwrap();
             ltys.push(self.acx.projection_lty(prev_lty, &proj));
         }
-        self.visit_place_ref(pl.as_ref(), &ltys, access);
+        self.visit_place_ref(pl.as_ref(), &ltys, access, require_single_ptr);
     }
 
     /// Generate rewrites for a `Place` represented as a `PlaceRef`.  `proj_ltys` gives the `LTy`
@@ -1003,6 +1189,7 @@ impl<'a, 'tcx> ExprRewriteVisitor<'a, 'tcx> {
         pl: PlaceRef<'tcx>,
         proj_ltys: &[LTy<'tcx>],
         access: PlaceAccess,
+        require_single_ptr: RequireSinglePointer,
     ) {
         let (&last_proj, rest) = match pl.projection.split_last() {
             Some(x) => x,
@@ -1023,36 +1210,62 @@ impl<'a, 'tcx> ExprRewriteVisitor<'a, 'tcx> {
         };
         match last_proj {
             PlaceElem::Deref => {
+                let cast_can_move = base_pl.is_local() && self.current_sub_loc_is_last_use();
                 self.enter_place_deref_pointer(|v| {
-                    v.visit_place_ref(base_pl, proj_ltys, access);
-                    if v.is_nullable(base_lty.label) {
-                        // If the pointer type is non-copy, downgrade (borrow) before calling
-                        // `unwrap()`.
+                    v.visit_place_ref(base_pl, proj_ltys, access, RequireSinglePointer::Yes);
+                    if !v.flags[base_lty.label].contains(FlagSet::FIXED) {
                         let desc = type_desc::perms_to_desc(
                             base_lty.ty,
                             v.perms[base_lty.label],
                             v.flags[base_lty.label],
                         );
-                        if !desc.own.is_copy() {
-                            v.emit(RewriteKind::OptionDowngrade {
+                        // TODO: This logic is quite similar to the cast builder code and could
+                        // probably be replaced with a call to `emit_cast_lty_adjust`.  But
+                        // currently this tries to introduce casts on the borrow projection in
+                        // `array.as_mut_ptr()`, which causes rewriting to fail.
+                        if v.is_nullable(base_lty.label) {
+                            // If the pointer type is non-copy, downgrade (borrow) before calling
+                            // `unwrap()`.
+                            if !desc.own.is_copy() {
+                                v.emit(RewriteKind::OptionDowngrade {
+                                    mutbl: access == PlaceAccess::Mut,
+                                    kind: if desc.dyn_owned {
+                                        OptionDowngradeKind::Borrow
+                                    } else if cast_can_move {
+                                        OptionDowngradeKind::MoveAndDeref
+                                    } else {
+                                        OptionDowngradeKind::Deref
+                                    },
+                                });
+                            }
+                            v.emit(RewriteKind::OptionUnwrap);
+                            if desc.dyn_owned {
+                                v.emit(RewriteKind::Deref);
+                            }
+                        }
+                        if desc.dyn_owned {
+                            // TODO: do we need a `MoveAndDeref` equivalent for `DynOwned`?
+                            v.emit(RewriteKind::DynOwnedDowngrade {
                                 mutbl: access == PlaceAccess::Mut,
-                                deref: true,
                             });
                         }
-                        v.emit(RewriteKind::OptionUnwrap);
-                    }
-                    if v.is_dyn_owned(base_lty) {
-                        v.emit(RewriteKind::DynOwnedDowngrade {
-                            mutbl: access == PlaceAccess::Mut,
-                        });
+                        if require_single_ptr.as_bool() && desc.qty != Quantity::Single {
+                            v.emit(RewriteKind::SliceFirst {
+                                mutbl: access == PlaceAccess::Mut,
+                            });
+                        }
                     }
                 });
             }
             PlaceElem::Field(_idx, _ty) => {
-                self.enter_place_field_base(|v| v.visit_place_ref(base_pl, proj_ltys, access));
+                self.enter_place_field_base(|v| {
+                    v.visit_place_ref(base_pl, proj_ltys, access, RequireSinglePointer::Yes)
+                });
             }
             PlaceElem::Index(_) | PlaceElem::ConstantIndex { .. } | PlaceElem::Subslice { .. } => {
-                self.enter_place_index_array(|v| v.visit_place_ref(base_pl, proj_ltys, access));
+                self.enter_place_index_array(|v| {
+                    v.visit_place_ref(base_pl, proj_ltys, access, RequireSinglePointer::Yes)
+                });
             }
             PlaceElem::Downcast(_, _) => {}
         }
@@ -1136,14 +1349,14 @@ impl<'a, 'tcx> ExprRewriteVisitor<'a, 'tcx> {
     fn emit_cast_desc_desc(&mut self, from: TypeDesc<'tcx>, to: TypeDesc<'tcx>) {
         let perms = self.perms;
         let flags = self.flags;
-        let mut builder = CastBuilder::new(self.acx.tcx(), &perms, &flags, |rk| self.emit(rk));
+        let mut builder = CastBuilder::new(self.acx.tcx(), perms, flags, |rk| self.emit(rk));
         builder.build_cast_desc_desc(from, to);
     }
 
     fn emit_cast_lty_desc(&mut self, from_lty: LTy<'tcx>, to: TypeDesc<'tcx>) {
         let perms = self.perms;
         let flags = self.flags;
-        let mut builder = CastBuilder::new(self.acx.tcx(), &perms, &flags, |rk| self.emit(rk));
+        let mut builder = CastBuilder::new(self.acx.tcx(), perms, flags, |rk| self.emit(rk));
         builder.build_cast_lty_desc(from_lty, to);
     }
 
@@ -1151,14 +1364,32 @@ impl<'a, 'tcx> ExprRewriteVisitor<'a, 'tcx> {
     fn emit_cast_desc_lty(&mut self, from: TypeDesc<'tcx>, to_lty: LTy<'tcx>) {
         let perms = self.perms;
         let flags = self.flags;
-        let mut builder = CastBuilder::new(self.acx.tcx(), &perms, &flags, |rk| self.emit(rk));
+        let mut builder = CastBuilder::new(self.acx.tcx(), perms, flags, |rk| self.emit(rk));
         builder.build_cast_desc_lty(from, to_lty);
     }
 
-    fn emit_cast_lty_lty(&mut self, from_lty: LTy<'tcx>, to_lty: LTy<'tcx>) {
+    /// Emit a cast from `from_lty` to `to_lty` at the current `(loc, sub_loc)`.  `is_local` should
+    /// be set when the thing being cast is a plain local with no projections; in that case, we may
+    /// apply special handling if this is the last use of the local.
+    fn emit_cast_lty_lty(&mut self, from_lty: LTy<'tcx>, to_lty: LTy<'tcx>, cast_can_move: bool) {
         let perms = self.perms;
         let flags = self.flags;
-        let mut builder = CastBuilder::new(self.acx.tcx(), &perms, &flags, |rk| self.emit(rk));
+        let mut builder = CastBuilder::new(self.acx.tcx(), perms, flags, |rk| self.emit(rk))
+            .can_move(cast_can_move);
+        builder.build_cast_lty_lty(from_lty, to_lty);
+    }
+
+    fn emit_cast_lty_lty_or_borrow(
+        &mut self,
+        from_lty: LTy<'tcx>,
+        to_lty: LTy<'tcx>,
+        cast_can_move: bool,
+    ) {
+        let perms = self.perms;
+        let flags = self.flags;
+        let mut builder = CastBuilder::new(self.acx.tcx(), perms, flags, |rk| self.emit(rk))
+            .can_move(cast_can_move)
+            .borrow(true);
         builder.build_cast_lty_lty(from_lty, to_lty);
     }
 
@@ -1171,7 +1402,7 @@ impl<'a, 'tcx> ExprRewriteVisitor<'a, 'tcx> {
     ) {
         let perms = self.perms;
         let flags = self.flags;
-        let mut builder = CastBuilder::new(self.acx.tcx(), &perms, &flags, |rk| self.emit(rk));
+        let mut builder = CastBuilder::new(self.acx.tcx(), perms, flags, |rk| self.emit(rk));
         builder.build_cast_lty_adjust(from_lty, to_adjust);
     }
 
@@ -1184,7 +1415,7 @@ impl<'a, 'tcx> ExprRewriteVisitor<'a, 'tcx> {
     ) {
         let perms = self.perms;
         let flags = self.flags;
-        let mut builder = CastBuilder::new(self.acx.tcx(), &perms, &flags, |rk| self.emit(rk));
+        let mut builder = CastBuilder::new(self.acx.tcx(), perms, flags, |rk| self.emit(rk));
         builder.build_cast_adjust_lty(from_adjust, to_lty);
     }
 }
@@ -1222,6 +1453,64 @@ impl ZeroizeType {
             _ => return None,
         })
     }
+
+    fn from_lty<'tcx>(
+        acx: &AnalysisCtxt<'_, 'tcx>,
+        perms: &GlobalPointerTable<PermissionSet>,
+        flags: &GlobalPointerTable<FlagSet>,
+        lty: LTy<'tcx>,
+    ) -> Option<ZeroizeType> {
+        Some(match *lty.kind() {
+            TyKind::Int(_) | TyKind::Uint(_) => ZeroizeType::Int,
+            TyKind::Bool => ZeroizeType::Bool,
+            TyKind::Adt(adt_def, substs) => {
+                if !adt_def.is_struct() {
+                    eprintln!("ZeroizeType::from_lty({lty:?}): not a struct");
+                    return None;
+                }
+                let variant = adt_def.non_enum_variant();
+                let mut fields = Vec::with_capacity(variant.fields.len());
+                for (field_idx, field) in variant.fields.iter().enumerate() {
+                    let name = field.name.to_string();
+                    let ty = field.ty(acx.tcx(), substs);
+                    let lty = acx.projection_lty(lty, &PlaceElem::Field(field_idx.into(), ty));
+                    let zero = ZeroizeType::from_lty(acx, perms, flags, lty)?;
+                    fields.push((name, zero));
+                }
+
+                let name_printer = FmtPrinter::new(acx.tcx(), Namespace::ValueNS);
+                let name = name_printer
+                    .print_value_path(adt_def.did(), &[])
+                    .unwrap()
+                    .into_buffer();
+
+                ZeroizeType::Struct(name, fields)
+            }
+            TyKind::Array(_, _) => {
+                let elem_zero = ZeroizeType::from_lty(acx, perms, flags, lty.args[0])?;
+                ZeroizeType::Array(Box::new(elem_zero))
+            }
+            TyKind::Ref(..) | TyKind::RawPtr(..) => {
+                if lty.label.is_none() {
+                    eprintln!("ZeroizeType::from_lty({lty:?}): ptr has no label");
+                    return None;
+                }
+                let ptr = lty.label;
+                if flags[ptr].contains(FlagSet::FIXED) {
+                    eprintln!("ZeroizeType::from_lty({lty:?}): ptr is FIXED");
+                    return None;
+                }
+                let nullable = !perms[ptr].contains(PermissionSet::NON_NULL);
+                if nullable {
+                    ZeroizeType::Option
+                } else {
+                    eprintln!("ZeroizeType::from_lty({lty:?}): ptr is NON_NULL");
+                    return None;
+                }
+            }
+            _ => return None,
+        })
+    }
 }
 
 pub struct CastBuilder<'a, 'tcx, PT1, PT2, F> {
@@ -1229,6 +1518,14 @@ pub struct CastBuilder<'a, 'tcx, PT1, PT2, F> {
     perms: &'a PT1,
     flags: &'a PT2,
     emit: F,
+    /// If set, the cast builder is allowed to move the expression being cast.  For example, we
+    /// might emit `ptr.map(|p| &mut *p).unwrap()` instead of `ptr.as_deref_mut().unwrap()` when
+    /// `can_move` is set; the former moves out of `ptr` but avoids an additional borrow, making it
+    /// suitable to be used as the result expression of a function.
+    can_move: bool,
+    /// If set, the cast builder will emit a downgrade/borrow operation even for no-op casts, if
+    /// the thing being cast can't be moved (`!can_move`) and also can't be copied.
+    borrow: bool,
 }
 
 impl<'a, 'tcx, PT1, PT2, F> CastBuilder<'a, 'tcx, PT1, PT2, F>
@@ -1248,7 +1545,19 @@ where
             perms,
             flags,
             emit,
+            can_move: false,
+            borrow: false,
         }
+    }
+
+    pub fn can_move(mut self, can_move: bool) -> Self {
+        self.can_move = can_move;
+        self
+    }
+
+    pub fn borrow(mut self, borrow: bool) -> Self {
+        self.borrow = borrow;
+        self
     }
 
     pub fn build_cast_desc_desc(&mut self, from: TypeDesc<'tcx>, to: TypeDesc<'tcx>) {
@@ -1282,9 +1591,48 @@ where
         from.pointee_ty = to.pointee_ty;
 
         if from == to {
+            // We normally do nothing if the `from` and `to` types are the same.  However, in some
+            // cases we need to introduce a downgrade to avoid moving the operand inappropriately.
+            let can_reborrow = !from.option && !from.dyn_owned;
+            let need_downgrade = !self.can_move && !from.own.is_copy() && !can_reborrow;
+            if self.borrow && need_downgrade {
+                let mutbl = match from.own {
+                    Ownership::Raw | Ownership::Imm | Ownership::Cell => false,
+                    Ownership::RawMut | Ownership::Mut => true,
+                    // Can't downgrade in these cases.
+                    Ownership::Rc | Ownership::Box => return Ok(()),
+                };
+                if from.option {
+                    (self.emit)(RewriteKind::OptionDowngrade {
+                        mutbl,
+                        kind: if from.dyn_owned {
+                            OptionDowngradeKind::Borrow
+                        } else {
+                            OptionDowngradeKind::Deref
+                        },
+                    });
+                }
+                if from.dyn_owned {
+                    if from.option {
+                        (self.emit)(RewriteKind::OptionMapBegin);
+                        (self.emit)(RewriteKind::Deref);
+                    }
+                    (self.emit)(RewriteKind::DynOwnedDowngrade { mutbl });
+                    if from.option {
+                        (self.emit)(RewriteKind::OptionMapEnd);
+                    }
+                }
+            }
+
             return Ok(());
         }
 
+        // To downgrade and unwrap a non-`dyn_owned` pointer, we call `p.as_deref().unwrap()`,
+        // which goes from `Option<Box<T>>` to `&T`.  To downgrade a `dyn_owned` pointer, we
+        // instead do `*p.as_ref().unwrap()`, which goes from `Option<DynOwned<T>>` to
+        // `DynOwned<T>`, with the latter being a read-only `Place` that can be further downgraded
+        // to eventually reach `&T`.
+        let mut deref_after_unwrap = false;
         if from.option && from.own != to.own {
             // Downgrade ownership before unwrapping the `Option` when possible.  This can avoid
             // moving/consuming the input.  For example, if the `from` type is `Option<Box<T>>` and
@@ -1297,15 +1645,29 @@ where
                     Ownership::Raw | Ownership::Imm => {
                         (self.emit)(RewriteKind::OptionDowngrade {
                             mutbl: false,
-                            deref: true,
+                            kind: if from.dyn_owned {
+                                OptionDowngradeKind::Borrow
+                            } else if self.can_move {
+                                OptionDowngradeKind::MoveAndDeref
+                            } else {
+                                OptionDowngradeKind::Deref
+                            },
                         });
+                        deref_after_unwrap = from.dyn_owned;
                         from.own = Ownership::Imm;
                     }
                     Ownership::RawMut | Ownership::Cell | Ownership::Mut => {
                         (self.emit)(RewriteKind::OptionDowngrade {
                             mutbl: true,
-                            deref: true,
+                            kind: if from.dyn_owned {
+                                OptionDowngradeKind::Borrow
+                            } else if self.can_move {
+                                OptionDowngradeKind::MoveAndDeref
+                            } else {
+                                OptionDowngradeKind::Deref
+                            },
                         });
+                        deref_after_unwrap = from.dyn_owned;
                         from.own = Ownership::Mut;
                     }
                     Ownership::Rc if from.own == Ownership::Rc => {
@@ -1328,6 +1690,9 @@ where
         if from.option && !to.option {
             // Unwrap first, then perform remaining casts.
             (self.emit)(RewriteKind::OptionUnwrap);
+            if deref_after_unwrap {
+                (self.emit)(RewriteKind::Deref);
+            }
             from.option = false;
         } else if from.option && to.option {
             trace!("try_build_cast_desc_desc: emit OptionMapBegin");
@@ -1345,6 +1710,9 @@ where
                 );
             }
             (self.emit)(RewriteKind::OptionMapBegin);
+            if deref_after_unwrap {
+                (self.emit)(RewriteKind::Deref);
+            }
             from.option = false;
             in_option_map = true;
         }
@@ -1660,15 +2028,66 @@ where
     }
 }
 
+trait IsLocal {
+    fn is_local(&self) -> bool;
+}
+
+impl IsLocal for Place<'_> {
+    fn is_local(&self) -> bool {
+        self.projection.is_empty()
+    }
+}
+
+impl IsLocal for PlaceRef<'_> {
+    fn is_local(&self) -> bool {
+        self.projection.is_empty()
+    }
+}
+
+impl IsLocal for Operand<'_> {
+    fn is_local(&self) -> bool {
+        self.place().map_or(false, |pl| pl.is_local())
+    }
+}
+
+impl IsLocal for Rvalue<'_> {
+    fn is_local(&self) -> bool {
+        match *self {
+            Rvalue::Use(ref op) => op.is_local(),
+            _ => false,
+        }
+    }
+}
+
+trait IsPlace {
+    fn is_place(&self) -> bool;
+}
+
+impl IsPlace for Operand<'_> {
+    fn is_place(&self) -> bool {
+        self.place().is_some()
+    }
+}
+
+impl IsPlace for Rvalue<'_> {
+    fn is_place(&self) -> bool {
+        match *self {
+            Rvalue::Use(ref op) => op.is_place(),
+            _ => false,
+        }
+    }
+}
+
 pub fn gen_mir_rewrites<'tcx>(
     acx: &AnalysisCtxt<'_, 'tcx>,
     asn: &Assignment,
     pointee_types: PointerTable<PointeeTypes<'tcx>>,
+    last_use: &LastUse,
     mir: &Body<'tcx>,
 ) -> (HashMap<Location, Vec<MirRewrite>>, DontRewriteFnReason) {
     let mut out = HashMap::new();
 
-    let mut v = ExprRewriteVisitor::new(acx, asn, pointee_types, &mut out, mir);
+    let mut v = ExprRewriteVisitor::new(acx, asn, pointee_types, last_use, &mut out, mir);
 
     for (bb_id, bb) in mir.basic_blocks().iter_enumerated() {
         for (i, stmt) in bb.statements.iter().enumerate() {

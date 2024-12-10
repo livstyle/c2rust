@@ -4,10 +4,7 @@ use crate::borrowck::{AdtMetadata, FieldMetadata, OriginArg, OriginParam};
 use crate::known_fn::{all_known_fns, KnownFn};
 use crate::labeled_ty::{LabeledTy, LabeledTyCtxt};
 use crate::panic_detail::PanicDetail;
-use crate::pointer_id::{
-    GlobalPointerTable, LocalPointerTable, NextGlobalPointerId, NextLocalPointerId, PointerTable,
-    PointerTableMut,
-};
+use crate::pointer_id::{GlobalPointerTable, LocalPointerTable, PointerTable, PointerTableMut};
 use crate::util::{self, describe_rvalue, PhantomLifetime, RvalueDesc};
 use assert_matches::assert_matches;
 use bitflags::bitflags;
@@ -248,7 +245,6 @@ bitflags! {
             | Self::DATAFLOW_INVALID.bits
             | Self::BORROWCK_INVALID.bits
             | Self::MISC_ANALYSIS_INVALID.bits
-            | Self::REWRITE_INVALID.bits
             | Self::FAKE_INVALID_FOR_TESTING.bits;
     }
 }
@@ -409,6 +405,8 @@ pub struct GlobalAnalysisCtxt<'tcx> {
     pub lcx: LTyCtxt<'tcx>,
 
     ptr_info: GlobalPointerTable<PointerInfo>,
+    /// Total number of global and local pointers across all functions.
+    num_total_pointers: usize,
 
     pub fn_sigs: HashMap<DefId, LFnSig<'tcx>>,
     pub fn_fields_used: MultiMap<LocalDefId, LocalDefId>,
@@ -424,6 +422,9 @@ pub struct GlobalAnalysisCtxt<'tcx> {
     pub dont_rewrite_fns: FlagMap<DefId, DontRewriteFnReason>,
     pub dont_rewrite_statics: FlagMap<DefId, DontRewriteStaticReason>,
     pub dont_rewrite_fields: FlagMap<DefId, DontRewriteFieldReason>,
+    /// Never mark these defs as `FIXED`, regardless of what `DontRewriteReason`s they might
+    /// acquire.
+    pub force_rewrite: HashSet<DefId>,
 
     /// `DefId`s of functions where analysis failed, and a [`PanicDetail`] explaining the reason
     /// for each failure.
@@ -642,10 +643,10 @@ fn construct_adt_metadata<'tcx>(
                 .table
                 .insert(adt_def.did(), AdtMetadata::default());
             let metadata = adt_metadata_table.table.get_mut(&adt_def.did()).unwrap();
-            eprintln!("gathering known lifetimes for {adt_def:?}");
+            debug!("gathering known lifetimes for {adt_def:?}");
             for sub in substs.iter() {
                 if let GenericArgKind::Lifetime(r) = sub.unpack() {
-                    eprintln!("\tfound lifetime {r:?} in {adt_def:?}");
+                    debug!("\nfound lifetime {r:?} in {adt_def:?}");
                     assert_matches!(r.kind(), ReEarlyBound(eb) => {
                         metadata.lifetime_params.insert(OriginParam::Actual(eb));
                     });
@@ -677,25 +678,25 @@ fn construct_adt_metadata<'tcx>(
         loop_count += 1;
         assert!(loop_count < 1000);
 
-        eprintln!("---- running fixed point struct field analysis iteration #{loop_count:?} ----");
+        info!("---- running fixed point struct field analysis iteration #{loop_count:?} ----");
         let old_adt_metadata = adt_metadata_table.table.clone();
         let mut next_hypo_origin_id = 0;
 
         // for each struct, gather lifetime information (actual and hypothetical)
         for struct_did in &adt_metadata_table.struct_dids {
             let adt_def = tcx.adt_def(struct_did);
-            eprintln!("gathering lifetimes and lifetime parameters for {adt_def:?}");
+            debug!("gathering lifetimes and lifetime parameters for {adt_def:?}");
             for field in adt_def.all_fields() {
                 let field_lty = field_ltys
                     .get(&field.did)
                     .unwrap_or_else(|| panic!("missing field_ltys entry for {:?}", field.did));
-                eprintln!("\t{adt_def:?}.{:}", field.name);
+                debug!("\t{adt_def:?}.{:}", field.name);
                 let field_origin_args = ltcx.relabel(field_lty, &mut |lty| {
                     let mut field_origin_args = IndexSet::new();
                     match lty.kind() {
                         TyKind::RawPtr(ty) => {
                             if needs_region(lty) {
-                                eprintln!(
+                                debug!(
                                     "\t\tfound pointer that requires hypothetical lifetime: *{:}",
                                     if let Mutability::Mut = ty.mutbl {
                                         "mut"
@@ -710,7 +711,7 @@ fn construct_adt_metadata<'tcx>(
                                         let origin_arg = OriginArg::Hypothetical(next_hypo_origin_id);
                                         let origin_param =
                                             OriginParam::Hypothetical(next_hypo_origin_id);
-                                        eprintln!(
+                                        debug!(
                                             "\t\t\tinserting origin {origin_param:?} into {adt_def:?}"
                                         );
 
@@ -721,7 +722,7 @@ fn construct_adt_metadata<'tcx>(
                             }
                         }
                         TyKind::Ref(reg, _ty, _mutability) => {
-                            eprintln!("\t\tfound reference field lifetime: {reg:}");
+                            debug!("\t\tfound reference field lifetime: {reg:}");
                             assert_matches!(reg.kind(), ReEarlyBound(..) | ReStatic);
                             let origin_arg = OriginArg::Actual(*reg);
                             adt_metadata_table
@@ -729,7 +730,7 @@ fn construct_adt_metadata<'tcx>(
                                 .entry(*struct_did)
                                 .and_modify(|adt| {
                                     if let ReEarlyBound(eb) = reg.kind() {
-                                        eprintln!("\t\t\tinserting origin {eb:?} into {adt_def:?}");
+                                        debug!("\t\tinserting origin {eb:?} into {adt_def:?}");
                                         adt.lifetime_params.insert(OriginParam::Actual(eb));
                                     }
 
@@ -737,11 +738,11 @@ fn construct_adt_metadata<'tcx>(
                                 });
                         }
                         TyKind::Adt(adt_field, substs) => {
-                            eprintln!("\t\tfound ADT field base type: {adt_field:?}");
+                            debug!("\t\tfound ADT field base type: {adt_field:?}");
                             for sub in substs.iter() {
                                 if let GenericArgKind::Lifetime(r) = sub.unpack() {
-                                    eprintln!("\tfound field lifetime {r:?} in {adt_def:?}.{adt_field:?}");
-                                    eprintln!("\t\t\tinserting {adt_field:?} lifetime param {r:?} into {adt_def:?}.{:} lifetime parameters", field.name);
+                                    debug!("\tfound field lifetime {r:?} in {adt_def:?}.{adt_field:?}");
+                                    debug!("\t\tinserting {adt_field:?} lifetime param {r:?} into {adt_def:?}.{:} lifetime parameters", field.name);
                                     assert_matches!(r.kind(), ReEarlyBound(..) | ReStatic);
                                     field_origin_args.insert(OriginArg::Actual(r));
                                 }
@@ -752,7 +753,7 @@ fn construct_adt_metadata<'tcx>(
                                 for adt_field_lifetime_param in adt_field_metadata.lifetime_params.iter() {
                                     adt_metadata_table.table.entry(*struct_did).and_modify(|adt| {
                                         if let OriginParam::Hypothetical(h) = adt_field_lifetime_param {
-                                            eprintln!("\t\t\tbubbling {adt_field:?} origin {adt_field_lifetime_param:?} up into {adt_def:?} origins");
+                                            debug!("\t\tbubbling {adt_field:?} origin {adt_field_lifetime_param:?} up into {adt_def:?} origins");
                                             field_origin_args.insert(OriginArg::Hypothetical(*h));
                                             adt.lifetime_params.insert(*adt_field_lifetime_param);
                                         }
@@ -783,11 +784,11 @@ fn construct_adt_metadata<'tcx>(
                     });
             }
 
-            eprintln!();
+            debug!("");
         }
 
         if adt_metadata_table.table == old_adt_metadata {
-            eprintln!("reached a fixed point in struct lifetime reconciliation\n");
+            info!("reached a fixed point in struct lifetime reconciliation\n");
             break;
         }
     }
@@ -801,6 +802,7 @@ impl<'tcx> GlobalAnalysisCtxt<'tcx> {
             tcx,
             lcx: LabeledTyCtxt::new(tcx),
             ptr_info: GlobalPointerTable::empty(),
+            num_total_pointers: 0,
             fn_sigs: HashMap::new(),
             fn_fields_used: MultiMap::new(),
             known_fns: all_known_fns()
@@ -810,6 +812,7 @@ impl<'tcx> GlobalAnalysisCtxt<'tcx> {
             dont_rewrite_fns: FlagMap::new(),
             dont_rewrite_statics: FlagMap::new(),
             dont_rewrite_fields: FlagMap::new(),
+            force_rewrite: HashSet::new(),
             fns_failed: HashMap::new(),
             field_ltys: HashMap::new(),
             field_users: MultiMap::new(),
@@ -834,8 +837,12 @@ impl<'tcx> GlobalAnalysisCtxt<'tcx> {
         self.fn_origins = fn_origin_args_params(self.tcx, &self.adt_metadata);
     }
 
-    pub fn function_context<'a>(&'a mut self, mir: &'a Body<'tcx>) -> AnalysisCtxt<'a, 'tcx> {
-        AnalysisCtxt::new(self, mir)
+    pub fn function_context<'a>(
+        &'a mut self,
+        mir: &'a Body<'tcx>,
+        local_ptr_base: u32,
+    ) -> AnalysisCtxt<'a, 'tcx> {
+        AnalysisCtxt::new(self, mir, local_ptr_base)
     }
 
     pub fn function_context_with_data<'a>(
@@ -850,8 +857,20 @@ impl<'tcx> GlobalAnalysisCtxt<'tcx> {
         self.ptr_info.push(info)
     }
 
-    pub fn num_pointers(&self) -> usize {
+    pub fn num_global_pointers(&self) -> usize {
         self.ptr_info.len()
+    }
+
+    pub fn num_total_pointers(&self) -> usize {
+        self.num_total_pointers
+    }
+
+    pub fn set_num_total_pointers(&mut self, n: usize) {
+        assert_eq!(
+            self.num_total_pointers, 0,
+            "num_total_pointers has already been set"
+        );
+        self.num_total_pointers = n;
     }
 
     pub fn ptr_info(&self) -> &GlobalPointerTable<PointerInfo> {
@@ -861,21 +880,19 @@ impl<'tcx> GlobalAnalysisCtxt<'tcx> {
     /// Update all [`PointerId`]s in `self`, replacing each `p` with `map[p]`.  Also sets the "next
     /// [`PointerId`]" counter to `counter`.  `map` and `counter` are usually computed together via
     /// [`GlobalEquivSet::renumber`][crate::equiv::GlobalEquivSet::renumber].
-    pub fn remap_pointers(
-        &mut self,
-        map: &GlobalPointerTable<PointerId>,
-        counter: NextGlobalPointerId,
-    ) {
+    pub fn remap_pointers(&mut self, map: &GlobalPointerTable<PointerId>, count: usize) {
         let GlobalAnalysisCtxt {
             tcx: _,
             lcx,
             ref mut ptr_info,
+            num_total_pointers: _,
             ref mut fn_sigs,
             fn_fields_used: _,
             known_fns: _,
             dont_rewrite_fns: _,
             dont_rewrite_statics: _,
             dont_rewrite_fields: _,
+            force_rewrite: _,
             fns_failed: _,
             ref mut field_ltys,
             field_users: _,
@@ -886,7 +903,7 @@ impl<'tcx> GlobalAnalysisCtxt<'tcx> {
             foreign_mentioned_tys: _,
         } = *self;
 
-        *ptr_info = remap_global_ptr_info(ptr_info, map, counter.num_pointers());
+        *ptr_info = remap_global_ptr_info(ptr_info, map, count);
 
         for sig in fn_sigs.values_mut() {
             sig.inputs = lcx.mk_slice(
@@ -981,16 +998,21 @@ impl<'tcx> GlobalAnalysisCtxt<'tcx> {
             .get(def_id)
             .intersects(DontRewriteFnReason::ANALYSIS_INVALID_MASK)
     }
+
+    pub fn ptr_is_global(&self, ptr: PointerId) -> bool {
+        self.ptr_info.contains(ptr)
+    }
 }
 
 impl<'a, 'tcx> AnalysisCtxt<'a, 'tcx> {
     pub fn new(
         gacx: &'a mut GlobalAnalysisCtxt<'tcx>,
         mir: &'a Body<'tcx>,
+        local_ptr_base: u32,
     ) -> AnalysisCtxt<'a, 'tcx> {
         AnalysisCtxt {
             gacx,
-            ptr_info: LocalPointerTable::empty(),
+            ptr_info: LocalPointerTable::empty(local_ptr_base),
             local_decls: &mir.local_decls,
             local_tys: IndexVec::new(),
             addr_of_local: IndexVec::new(),
@@ -1056,8 +1078,16 @@ impl<'a, 'tcx> AnalysisCtxt<'a, 'tcx> {
         self.gacx.ptr_info.and_mut(&mut self.ptr_info)
     }
 
-    pub fn _local_ptr_info(&self) -> &LocalPointerTable<PointerInfo> {
+    pub fn local_ptr_info(&self) -> &LocalPointerTable<PointerInfo> {
         &self.ptr_info
+    }
+
+    pub fn local_ptr_base(&self) -> u32 {
+        self.ptr_info.base()
+    }
+
+    pub fn ptr_is_global(&self, ptr: PointerId) -> bool {
+        self.gacx.ptr_is_global(ptr)
     }
 
     pub fn type_of<T: TypeOf<'tcx>>(&self, x: T) -> LTy<'tcx> {
@@ -1127,9 +1157,13 @@ impl<'a, 'tcx> AnalysisCtxt<'a, 'tcx> {
             let ty = rv.ty(self, self.tcx());
             if matches!(ty.kind(), TyKind::Ref(..) | TyKind::RawPtr(..)) {
                 let (pointee_lty, proj, ptr) = match desc {
-                    RvalueDesc::Project { base, proj } => {
+                    RvalueDesc::Project {
+                        base,
+                        proj,
+                        mutbl: _,
+                    } => {
                         let base_lty = self.type_of(base);
-                        eprintln!(
+                        debug!(
                             "rvalue = {:?}, desc = {:?}, base_lty = {:?}",
                             rv, desc, base_lty
                         );
@@ -1139,9 +1173,11 @@ impl<'a, 'tcx> AnalysisCtxt<'a, 'tcx> {
                             base_lty.label,
                         )
                     }
-                    RvalueDesc::AddrOfLocal { local, proj } => {
-                        (self.type_of(local), proj, self.addr_of_local[local])
-                    }
+                    RvalueDesc::AddrOfLocal {
+                        local,
+                        proj,
+                        mutbl: _,
+                    } => (self.type_of(local), proj, self.addr_of_local[local]),
                 };
 
                 let mut pointee_lty = pointee_lty;
@@ -1203,7 +1239,7 @@ impl<'a, 'tcx> AnalysisCtxt<'a, 'tcx> {
         let projection_lty = |_lty: LTy, adt_def: AdtDef, field: Field| {
             let field_def = &adt_def.non_enum_variant().fields[field.index()];
             let field_def_name = field_def.name;
-            eprintln!("projecting into {adt_def:?}.{field_def_name:}");
+            debug!("projecting into {adt_def:?}.{field_def_name:}");
             let field_lty: LTy = self.gacx.field_ltys.get(&field_def.did).unwrap_or_else(|| {
                 panic!("Could not find {adt_def:?}.{field_def_name:?} in field type map")
             });
@@ -1221,7 +1257,8 @@ impl<'tcx> AnalysisCtxtData<'tcx> {
         &mut self,
         gacx: &mut GlobalAnalysisCtxt<'tcx>,
         map: PointerTable<PointerId>,
-        counter: NextLocalPointerId,
+        local_base: u32,
+        local_count: usize,
     ) {
         let lcx = gacx.lcx;
 
@@ -1234,7 +1271,7 @@ impl<'tcx> AnalysisCtxtData<'tcx> {
         } = self;
 
         *ptr_info =
-            remap_local_ptr_info(ptr_info, &mut gacx.ptr_info, &map, counter.num_pointers());
+            remap_local_ptr_info(ptr_info, &mut gacx.ptr_info, &map, local_base, local_count);
 
         for lty in local_tys {
             *lty = remap_lty_pointers(lcx, &map, lty);
@@ -1257,6 +1294,10 @@ impl<'tcx> AnalysisCtxtData<'tcx> {
 
     pub fn num_pointers(&self) -> usize {
         self.ptr_info.len()
+    }
+
+    pub fn local_ptr_base(&self) -> u32 {
+        self.ptr_info.base()
     }
 }
 
@@ -1296,12 +1337,13 @@ fn remap_local_ptr_info(
     old_local_ptr_info: &LocalPointerTable<PointerInfo>,
     new_global_ptr_info: &mut GlobalPointerTable<PointerInfo>,
     map: &PointerTable<PointerId>,
-    num_pointers: usize,
+    base: u32,
+    count: usize,
 ) -> LocalPointerTable<PointerInfo> {
-    let mut new_local_ptr_info = LocalPointerTable::<PointerInfo>::new(num_pointers);
+    let mut new_local_ptr_info = LocalPointerTable::<PointerInfo>::new(base, count);
     let mut new_ptr_info = new_global_ptr_info.and_mut(&mut new_local_ptr_info);
     for (old, &new) in map.iter() {
-        if old.is_global() {
+        if !old_local_ptr_info.contains(old) {
             // If `old` is global then `new` is also global, and this remapping was handled already
             // by `remap_global_ptr_info`.
             continue;
@@ -1427,78 +1469,33 @@ pub fn label_no_pointers<'tcx>(acx: &AnalysisCtxt<'_, 'tcx>, ty: Ty<'tcx>) -> LT
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub struct GlobalAssignment {
+pub struct Assignment {
     pub perms: GlobalPointerTable<PermissionSet>,
     pub flags: GlobalPointerTable<FlagSet>,
 }
 
-impl GlobalAssignment {
-    pub fn new(
-        len: usize,
-        default_perms: PermissionSet,
-        default_flags: FlagSet,
-    ) -> GlobalAssignment {
-        GlobalAssignment {
+impl Assignment {
+    pub fn new(len: usize, default_perms: PermissionSet, default_flags: FlagSet) -> Assignment {
+        Assignment {
             perms: GlobalPointerTable::from_raw(vec![default_perms; len]),
             flags: GlobalPointerTable::from_raw(vec![default_flags; len]),
         }
     }
 
-    pub fn and<'a>(&'a mut self, local: &'a mut LocalAssignment) -> Assignment<'a> {
-        Assignment {
-            global: self,
-            local,
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct LocalAssignment {
-    pub perms: LocalPointerTable<PermissionSet>,
-    pub flags: LocalPointerTable<FlagSet>,
-}
-
-impl LocalAssignment {
-    pub fn new(
-        len: usize,
-        default_perms: PermissionSet,
-        default_flags: FlagSet,
-    ) -> LocalAssignment {
-        LocalAssignment {
-            perms: LocalPointerTable::from_raw(vec![default_perms; len]),
-            flags: LocalPointerTable::from_raw(vec![default_flags; len]),
-        }
-    }
-}
-
-pub struct Assignment<'a> {
-    pub global: &'a mut GlobalAssignment,
-    local: &'a mut LocalAssignment,
-}
-
-impl Assignment<'_> {
-    pub fn perms(&self) -> PointerTable<PermissionSet> {
-        self.global.perms.and(&self.local.perms)
+    pub fn perms(&self) -> &GlobalPointerTable<PermissionSet> {
+        &self.perms
     }
 
-    pub fn perms_mut(&mut self) -> PointerTableMut<PermissionSet> {
-        self.global.perms.and_mut(&mut self.local.perms)
+    pub fn perms_mut(&mut self) -> &mut GlobalPointerTable<PermissionSet> {
+        &mut self.perms
     }
 
-    pub fn flags(&self) -> PointerTable<FlagSet> {
-        self.global.flags.and(&self.local.flags)
+    pub fn flags(&self) -> &GlobalPointerTable<FlagSet> {
+        &self.flags
     }
 
-    #[allow(dead_code)]
-    pub fn _flags_mut(&mut self) -> PointerTableMut<FlagSet> {
-        self.global.flags.and_mut(&mut self.local.flags)
-    }
-
-    pub fn all_mut(&mut self) -> (PointerTableMut<PermissionSet>, PointerTableMut<FlagSet>) {
-        (
-            self.global.perms.and_mut(&mut self.local.perms),
-            self.global.flags.and_mut(&mut self.local.flags),
-        )
+    pub fn _flags_mut(&mut self) -> &mut GlobalPointerTable<FlagSet> {
+        &mut self.flags
     }
 }
 

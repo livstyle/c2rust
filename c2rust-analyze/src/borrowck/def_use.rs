@@ -1,4 +1,5 @@
 use crate::borrowck::atoms::{AllFacts, AtomMaps, Loan, Path, SubPoint};
+use log::debug;
 use rustc_middle::mir::visit::{
     MutatingUseContext, NonMutatingUseContext, NonUseContext, PlaceContext, Visitor,
 };
@@ -33,12 +34,31 @@ pub fn categorize(context: PlaceContext) -> Option<DefUse> {
         // path and not the unwind path. -nmatsakis
         PlaceContext::MutatingUse(MutatingUseContext::Call) |
         PlaceContext::MutatingUse(MutatingUseContext::AsmOutput) |
-        PlaceContext::MutatingUse(MutatingUseContext::Yield) |
+        PlaceContext::MutatingUse(MutatingUseContext::Yield) => Some(DefUse::Def),
 
         // Storage live and storage dead aren't proper defines, but we can ignore
         // values that come before them.
+        //
+        // C2Rust: For borrowchecking purposes, we ignore `StorageLive` and `StorageDead`.  In the
+        // original version of this function, they're considered to be `DefUse::Def`s, but this
+        // approach creates a problem for code like this:
+        //
+        // ```
+        // let q = {
+        //   let p = &mut ...;
+        //   p
+        // };
+        // *q = 1;
+        // ```
+        //
+        // The MIR for this has an assignment like `q = p`, followed by `StorageDead(p)`.  We
+        // interpret the assignment as a reborrow of `p`, and if `StorageDead(p)` was considered a
+        // `Def`, we would invalidate the loan at the end of the block when `StorageDead` "writes"
+        // to `p`.  However, this code is perfectly valid, and omitting `loan_invalidated_at` for
+        // `StorageLive` and `StorageDead` appears to be consistent with `rustc -Z nll-facts`
+        // output (tested on `tests/filecheck/move_mut.rs`).
         PlaceContext::NonUse(NonUseContext::StorageLive) |
-        PlaceContext::NonUse(NonUseContext::StorageDead) => Some(DefUse::Def),
+        PlaceContext::NonUse(NonUseContext::StorageDead) => None,
 
         ///////////////////////////////////////////////////////////////////////////
         // REGULAR USES
@@ -96,7 +116,7 @@ struct DefUseVisitor<'tcx, 'a> {
 impl<'tcx> Visitor<'tcx> for DefUseVisitor<'tcx, '_> {
     fn visit_place(&mut self, place: &Place<'tcx>, context: PlaceContext, location: Location) {
         self.super_place(place, context, location);
-        eprintln!(
+        debug!(
             "visit place {:?} with context {:?} = {:?} at {:?}",
             place,
             context,
@@ -132,7 +152,7 @@ impl<'tcx> Visitor<'tcx> for DefUseVisitor<'tcx, '_> {
     }
 
     fn visit_local(&mut self, local: Local, context: PlaceContext, location: Location) {
-        eprintln!(
+        debug!(
             "visit local {:?} with context {:?} = {:?} at {:?}",
             local,
             context,
@@ -157,7 +177,7 @@ impl<'tcx> Visitor<'tcx> for DefUseVisitor<'tcx, '_> {
 
     fn visit_statement(&mut self, stmt: &Statement<'tcx>, location: Location) {
         self.super_statement(stmt, location);
-        eprintln!("visit stmt {:?} at {:?}", stmt, location);
+        debug!("visit stmt {:?} at {:?}", stmt, location);
 
         if let StatementKind::StorageDead(local) = stmt.kind {
             // Observed: `StorageDead` emits `path_moved_at_base` at the `Mid` point.
@@ -194,7 +214,7 @@ impl<'tcx> LoanInvalidatedAtVisitor<'tcx, '_> {
         context: PlaceContext,
         location: Location,
     ) {
-        eprintln!(
+        debug!(
             "access loan {:?} (kind {:?}) at location {:?} (context {:?} = {:?})",
             loan,
             borrow_kind,
@@ -223,7 +243,7 @@ impl<'tcx> LoanInvalidatedAtVisitor<'tcx, '_> {
 impl<'tcx> Visitor<'tcx> for LoanInvalidatedAtVisitor<'tcx, '_> {
     fn visit_place(&mut self, place: &Place<'tcx>, context: PlaceContext, location: Location) {
         //self.super_place(place, context, location);
-        eprintln!(
+        debug!(
             "loan_invalidated_at: visit place {:?} with context {:?} = {:?} at {:?}",
             place,
             context,
@@ -260,7 +280,7 @@ impl<'tcx> Visitor<'tcx> for LoanInvalidatedAtVisitor<'tcx, '_> {
     }
 
     fn visit_local(&mut self, local: Local, context: PlaceContext, location: Location) {
-        eprintln!(
+        debug!(
             "loan_invalidated_at: visit local {:?} with context {:?} = {:?} at {:?}",
             local,
             context,

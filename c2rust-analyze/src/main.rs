@@ -23,6 +23,7 @@ mod dataflow;
 mod equiv;
 mod known_fn;
 mod labeled_ty;
+mod last_use;
 mod log;
 mod panic_detail;
 mod pointee_type;
@@ -97,12 +98,33 @@ struct Args {
     #[clap(long)]
     use_manual_shims: bool,
 
+    /// Add "start/end of def" annotations as comments around each definition.  These annotations
+    /// are used by `scripts/extract_working_defs.py` to locate specific defs in the rewritten
+    /// code.
+    #[clap(long)]
+    annotate_def_spans: bool,
+
+    /// Completely disable the `borrowck` pass.  All pointers will be given the `UNIQUE`
+    /// permission; none will be wrapped in `Cell`.
+    #[clap(long)]
+    skip_borrowck: bool,
+
     /// Read a list of defs that should be marked non-rewritable (`FIXED`) from this file path.
     /// Run `c2rust-analyze` without this option and check the debug output for a full list of defs
     /// in the crate being analyzed; the file passed to this option should list a subset of those
     /// defs.
     #[clap(long)]
     fixed_defs_list: Option<PathBuf>,
+
+    /// Read a list of defs that should always be rewritable (not `FIXED`) from this file path.
+    /// This suppresses the rewriter's default behavior of skipping over defs that encounter
+    /// analysis or rewriting errors.
+    #[clap(long)]
+    force_rewrite_defs_list: Option<PathBuf>,
+
+    /// Read a list of defs on which the pointee type analysis should be skipped.
+    #[clap(long)]
+    skip_pointee_defs_list: Option<PathBuf>,
 
     /// `cargo` args.
     cargo_args: Vec<OsString>,
@@ -216,7 +238,7 @@ impl Cargo {
         f(&mut cmd)?;
         let status = cmd.status()?;
         if !status.success() {
-            eprintln!("error ({status}) running: {cmd:?}");
+            ::log::error!("error ({status}) running: {cmd:?}");
             exit_with_status(status);
         }
         Ok(())
@@ -390,7 +412,11 @@ fn cargo_wrapper(rustc_wrapper: &Path) -> anyhow::Result<()> {
         mut rewrite_mode,
         rewrite_in_place,
         use_manual_shims,
+        annotate_def_spans,
+        skip_borrowck,
         fixed_defs_list,
+        force_rewrite_defs_list,
+        skip_pointee_defs_list,
         cargo_args,
     } = Args::parse();
 
@@ -438,6 +464,14 @@ fn cargo_wrapper(rustc_wrapper: &Path) -> anyhow::Result<()> {
             cmd.env("C2RUST_ANALYZE_FIXED_DEFS_LIST", fixed_defs_list);
         }
 
+        if let Some(ref force_rewrite_defs_list) = force_rewrite_defs_list {
+            cmd.env("C2RUST_ANALYZE_FORCE_REWRITE_LIST", force_rewrite_defs_list);
+        }
+
+        if let Some(ref skip_pointee_defs_list) = skip_pointee_defs_list {
+            cmd.env("C2RUST_ANALYZE_SKIP_POINTEE_LIST", skip_pointee_defs_list);
+        }
+
         if !rewrite_paths.is_empty() {
             let rewrite_paths = rewrite_paths.join(OsStr::new(","));
             cmd.env("C2RUST_ANALYZE_REWRITE_PATHS", rewrite_paths);
@@ -455,6 +489,14 @@ fn cargo_wrapper(rustc_wrapper: &Path) -> anyhow::Result<()> {
 
         if use_manual_shims {
             cmd.env("C2RUST_ANALYZE_USE_MANUAL_SHIMS", "1");
+        }
+
+        if annotate_def_spans {
+            cmd.env("C2RUST_ANALYZE_ANNOTATE_DEF_SPANS", "1");
+        }
+
+        if skip_borrowck {
+            cmd.env("C2RUST_ANALYZE_SKIP_BORROWCK", "1");
         }
 
         Ok(())

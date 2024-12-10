@@ -1,4 +1,5 @@
 use crate::rewrite::Rewrite;
+use log::warn;
 use rustc_hir::Mutability;
 use rustc_span::source_map::{FileName, SourceMap};
 use rustc_span::{BytePos, SourceFile, Span, SyntaxContext};
@@ -361,7 +362,7 @@ impl<S: Sink> Emitter<'_, S> {
                 })
             }
             Rewrite::MethodCall(ref method, ref receiver_rw, ref arg_rws) => {
-                self.emit(receiver_rw, 0)?;
+                self.emit(receiver_rw, 3)?;
                 self.emit_str(".")?;
                 self.emit_str(method)?;
                 self.emit_parenthesized(true, |slf| {
@@ -416,6 +417,20 @@ impl<S: Sink> Emitter<'_, S> {
                 self.emit_str(name)?;
                 self.emit_str("| ")?;
                 self.emit(rw, 0)
+            }
+
+            Rewrite::Match(ref expr, ref cases) => {
+                self.emit_str("match ")?;
+                self.emit(expr, 0)?;
+                self.emit_str(" {\n")?;
+                for &(ref pat, ref body) in cases {
+                    self.emit_str("    ")?;
+                    self.emit_str(pat)?;
+                    self.emit_str(" => ")?;
+                    self.emit(body, 0)?;
+                    self.emit_str(",\n")?;
+                }
+                self.emit_str("}")
             }
 
             Rewrite::TyPtr(ref rw, mutbl) => {
@@ -650,7 +665,7 @@ pub fn apply_rewrites(
 ) -> HashMap<FileName, FileRewrite> {
     let (rts, errs) = RewriteTree::build(rws);
     for (span, rw, err) in errs {
-        eprintln!(
+        warn!(
             "{:?}: warning: failed to apply rewrite {:?}: {:?}",
             span, rw, err
         );

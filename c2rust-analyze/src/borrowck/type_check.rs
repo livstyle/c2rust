@@ -3,10 +3,11 @@ use crate::borrowck::{assign_origins, construct_adt_origins, LTy, LTyCtxt, Label
 use crate::context::{const_alloc_id, find_static_for_alloc};
 use crate::context::{AnalysisCtxt, PermissionSet};
 use crate::panic_detail;
-use crate::pointer_id::PointerTableMut;
+use crate::pointer_id::GlobalPointerTable;
 use crate::util::{self, ty_callee, Callee};
 use assert_matches::assert_matches;
 use indexmap::IndexMap;
+use log::debug;
 use rustc_hir::def_id::DefId;
 use rustc_index::vec::IndexVec;
 use rustc_middle::mir::{
@@ -26,8 +27,9 @@ struct TypeChecker<'tcx, 'a> {
     maps: &'a mut AtomMaps<'tcx>,
     loans: &'a mut HashMap<Local, Vec<(Path, Loan, BorrowKind)>>,
     local_ltys: &'a [LTy<'tcx>],
+    rvalue_ltys: &'a HashMap<Location, LTy<'tcx>>,
     field_permissions: &'a HashMap<DefId, PermissionSet>,
-    hypothesis: &'a PointerTableMut<'a, PermissionSet>,
+    hypothesis: &'a GlobalPointerTable<PermissionSet>,
     local_decls: &'a IndexVec<Local, LocalDecl<'tcx>>,
     current_location: Location,
     static_origin: Origin,
@@ -66,7 +68,7 @@ impl<'tcx> TypeChecker<'tcx, '_> {
                                 OriginParam::try_from(&oa).unwrap()
                             })
                             .and_then(|o| {
-                                eprintln!(
+                                debug!(
                                     "finding {o:?} in {base_adt_def:?} {base_origin_param_map:?}"
                                 );
                                 base_origin_param_map.get(&o)
@@ -107,7 +109,7 @@ impl<'tcx> TypeChecker<'tcx, '_> {
                             `'0`) and `Foo` lifetime parameter `'a`. This mapping is created below.
                         */
                         let mut field_origin_param_map = vec![];
-                        eprintln!("{:?}", fadt_def.did());
+                        debug!("{:?}", fadt_def.did());
                         let field_adt_metadata = if let Some(field_adt_metadata) = self.acx.gacx.adt_metadata.table.get(&fadt_def.did()) {
                             field_adt_metadata
                         } else {
@@ -127,7 +129,7 @@ impl<'tcx> TypeChecker<'tcx, '_> {
                             field_lifetime_param.and_then(|field_lifetime_param| {
                                 base_origin_param_map.get_key_value(&field_lifetime_param)
                             }).map(|(base_lifetime_param, og)| {
-                                eprintln!(
+                                debug!(
                                     "mapping {base_adt_def:?} lifetime parameter {base_lifetime_param:?} to \
                                     {base_adt_def:?}.{:} struct definition lifetime parameter {field_struct_lifetime_param:?}, \
                                     corresponding to its lifetime parameter {field_lifetime_param:?} within {base_adt_def:?}",
@@ -160,7 +162,7 @@ impl<'tcx> TypeChecker<'tcx, '_> {
         for proj in pl.projection {
             lty = util::lty_project(lty, &proj, &mut |lty, adt, f| self.field_lty(lty, adt, f));
         }
-        eprintln!("final label for {pl:?}: {:?}", lty);
+        debug!("final label for {pl:?}: {:?}", lty);
         lty
     }
 
@@ -188,19 +190,19 @@ impl<'tcx> TypeChecker<'tcx, '_> {
                                 };
                                 if let Some(origin) = l.label.origin {
                                     // constrain this origin to be 'static
-                                    eprintln!("constraining origin {origin:?} to 'static lifetime");
+                                    debug!("constraining origin {origin:?} to 'static lifetime");
                                     add_subset_base(static_origin, origin);
                                     add_subset_base(origin, static_origin)
                                 }
                                 for (op, origin) in l.label.origin_params {
                                     // constrain this origin to be 'static
-                                    eprintln!("constraining origin {op:?} ({origin:?}) to 'static lifetime");
+                                    debug!("constraining origin {op:?} ({origin:?}) to 'static lifetime");
                                     add_subset_base(static_origin, *origin);
                                     add_subset_base(*origin, static_origin);
                                 }
                             }
 
-                            eprintln!("NEW STATIC LTY: {:?}", c.ty().kind());
+                            debug!("NEW STATIC LTY: {:?}", c.ty().kind());
                             let pointer_id = self.acx.type_of(op).label;
                             let perm = self.hypothesis[pointer_id];
                             let args = self.ltcx.mk_slice(&[lty]);
@@ -240,7 +242,7 @@ impl<'tcx> TypeChecker<'tcx, '_> {
             .push((path, loan, borrow_kind));
         let point = self.current_point(SubPoint::Mid);
         self.facts.loan_issued_at.push((origin, loan, point));
-        eprintln!("issued loan {:?} = {:?} ({:?})", loan, pl, borrow_kind);
+        debug!("issued loan {:?} = {:?} ({:?})", loan, pl, borrow_kind);
         origin
     }
 
@@ -389,7 +391,7 @@ impl<'tcx> TypeChecker<'tcx, '_> {
                 self.do_assign(result_lty, op_lty);
                 result_lty
             }
-            Rvalue::Cast(_, _, ty) => self.ltcx.label(ty, &mut |_ty| {
+            Rvalue::Cast(_, _, _ty) => {
                 // TODO: handle Unsize casts at minimum
                 /*
                 assert!(
@@ -397,8 +399,9 @@ impl<'tcx> TypeChecker<'tcx, '_> {
                     "pointer Cast NYI"
                 );
                 */
-                Label::default()
-            }),
+                // TODO: connect this type to the type of the operand
+                self.rvalue_ltys[&self.current_location]
+            }
             Rvalue::Aggregate(ref kind, ref ops) => match **kind {
                 AggregateKind::Array(..) => {
                     let ty = rv.ty(self.local_decls, *self.ltcx);
@@ -447,11 +450,11 @@ impl<'tcx> TypeChecker<'tcx, '_> {
                     for (fid, op) in ops.iter().enumerate() {
                         let field_lty = self.field_lty(expect_ty, adt_def, Field::from(fid));
                         let op_lty = self.visit_operand(op);
-                        eprintln!("pseudo-assigning fields {field_lty:?} = {op_lty:?}");
+                        debug!("pseudo-assigning fields {field_lty:?} = {op_lty:?}");
                         self.do_assign(field_lty, op_lty);
                     }
 
-                    eprintln!("Aggregate literal label: {expect_ty:?}");
+                    debug!("Aggregate literal label: {expect_ty:?}");
                     expect_ty
                 }
                 _ => panic!("unsupported rvalue AggregateKind {:?}", kind),
@@ -478,7 +481,7 @@ impl<'tcx> TypeChecker<'tcx, '_> {
     }
 
     fn do_assign(&mut self, pl_lty: LTy<'tcx>, rv_lty: LTy<'tcx>) {
-        eprintln!("assign {:?} = {:?}", pl_lty, rv_lty);
+        debug!("assign {:?} = {:?}", pl_lty, rv_lty);
 
         match (pl_lty.ty.kind(), rv_lty.ty.kind()) {
             // exempt pointer casts such as `PointerCast::MutToConstPointer`
@@ -529,7 +532,7 @@ impl<'tcx> TypeChecker<'tcx, '_> {
     }
 
     pub fn visit_terminator(&mut self, term: &Terminator<'tcx>) {
-        eprintln!("borrowck: visit_terminator({:?})", term.kind);
+        debug!("borrowck: visit_terminator({:?})", term.kind);
         let _g = panic_detail::set_current_span(term.source_info.span);
         // TODO(spernsteiner): other `TerminatorKind`s will be handled in the future
         #[allow(clippy::single_match)]
@@ -543,7 +546,7 @@ impl<'tcx> TypeChecker<'tcx, '_> {
             } => {
                 let func_ty = func.ty(self.local_decls, *self.ltcx);
                 let callee = ty_callee(*self.ltcx, func_ty);
-                eprintln!("callee = {callee:?}");
+                debug!("callee = {callee:?}");
                 match callee {
                     Callee::Trivial => {}
                     Callee::UnknownDef { .. } => {
@@ -623,8 +626,9 @@ pub fn visit_body<'tcx>(
     maps: &mut AtomMaps<'tcx>,
     loans: &mut HashMap<Local, Vec<(Path, Loan, BorrowKind)>>,
     local_ltys: &[LTy<'tcx>],
+    rvalue_ltys: &HashMap<Location, LTy<'tcx>>,
     field_permissions: &HashMap<DefId, PermissionSet>,
-    hypothesis: &PointerTableMut<PermissionSet>,
+    hypothesis: &GlobalPointerTable<PermissionSet>,
     mir: &Body<'tcx>,
     static_origin: Origin,
 ) {
@@ -635,6 +639,7 @@ pub fn visit_body<'tcx>(
         maps,
         loans,
         local_ltys,
+        rvalue_ltys,
         field_permissions,
         hypothesis,
         local_decls: &mir.local_decls,
